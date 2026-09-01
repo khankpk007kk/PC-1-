@@ -18,6 +18,8 @@ if "doc_data" not in st.session_state:
     st.session_state.doc_data = None
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
+if "used_model" not in st.session_state:
+    st.session_state.used_model = "None"
 
 def get_base64_image(image_path):
     if os.path.exists(image_path):
@@ -41,7 +43,7 @@ st.markdown("""
     .stButton button:hover { background-color: #047857 !important; }
     .chat-bubble-user { background-color: #e2e8f0; padding: 10px 15px; border-radius: 15px 15px 0 15px; margin-bottom: 10px; width: fit-content; max-width: 80%; margin-left: auto; border: 1px solid #cbd5e1; }
     .chat-bubble-ai { background-color: #d1fae5; padding: 10px 15px; border-radius: 15px 15px 15px 0; margin-bottom: 10px; width: fit-content; max-width: 80%; border: 1px solid #a7f3d0; }
-    
+    .model-badge { display: inline-block; padding: 4px 10px; background-color: #f1f5f9; border: 1px solid #cbd5e1; border-radius: 20px; font-size: 11px; color: #475569; margin-bottom: 10px; font-family: monospace; }
     @media print {
         [data-testid="stSidebar"], header, .stButton, .stTabs [data-baseweb="tab-list"], .stFileUploader, .stChatInput { display: none !important; }
         [data-testid="stAppViewContainer"] { background-color: white !important; }
@@ -101,6 +103,42 @@ pc1_schema = types.Schema(
     required=["projectTitle", "departmentName", "totalBudget", "components", "districtWiseAllocation"]
 )
 
+# --- AUTO-ROUTING AI FALLBACK ENGINE ---
+def generate_with_fallback(client, prompt, document_text="", is_json=False, schema=None):
+    # Sequential list of free models from most advanced to most basic
+    models_to_try = [
+        'gemini-1.5-pro-latest',
+        'gemini-1.5-pro',
+        'gemini-1.5-flash',
+        'gemini-1.0-pro'
+    ]
+    
+    last_error = ""
+    for model_name in models_to_try:
+        try:
+            if is_json:
+                # 1.0-pro does not natively support structured JSON schema, so skip it for JSON tasks
+                if model_name == 'gemini-1.0-pro': continue 
+                
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=[prompt, document_text],
+                    config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=schema, temperature=0.1)
+                )
+            else:
+                response = client.models.generate_content(
+                    model=model_name, 
+                    contents=prompt
+                )
+            
+            return response.text, model_name
+            
+        except Exception as e:
+            last_error = str(e)
+            continue # If error (like 404), silently skip to the next model
+            
+    raise Exception(f"All available models failed on this API token. Last Error: {last_error}")
+
 # --- TABS NAVIGATION ---
 tab1, tab2, tab3, tab4, tab5 = st.tabs(["📤 Upload PDF", "📊 PC-1 Breakdown", "💬 AI Chat", "📝 Database & Comments", "🗺️ Map Analytics"])
 
@@ -110,7 +148,7 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs(["📤 Upload PDF", "📊 PC-1 Breakdown"
 with tab1:
     uploaded_file = st.file_uploader("Upload PC-1 / PC-2 Document (PDF Format)", type=['pdf'])
     if uploaded_file and st.button("🚀 Process & Secure Document"):
-        with st.spinner("Extracting & Analyzing with Gemini 1.5 Flash..."):
+        with st.spinner("Auto-Routing to best available AI Model..."):
             try:
                 reader = PyPDF2.PdfReader(uploaded_file)
                 extracted_text = "\n".join([page.extract_text() for page in reader.pages if page.extract_text()])
@@ -119,15 +157,13 @@ with tab1:
                     st.error("Could not extract text. Please ensure the PDF is not a scanned image.")
                 else:
                     st.session_state.doc_text = extracted_text
-                    
                     prompt = "Parse this PC-1 form. Extract title, department, total budget, breakdown of components, and district allocations with coordinates."
-                    response = client.models.generate_content(
-                        model='gemini-1.5-flash',
-                        contents=[prompt, extracted_text],
-                        config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=pc1_schema, temperature=0.1)
-                    )
                     
-                    data = json.loads(response.text)
+                    # Uses Fallback Engine
+                    result_text, active_model = generate_with_fallback(client, prompt, extracted_text, is_json=True, schema=pc1_schema)
+                    st.session_state.used_model = active_model
+                    
+                    data = json.loads(result_text)
                     st.session_state.doc_data = data
                     
                     supabase.rpc('insert_secure_pc1', {
@@ -140,7 +176,8 @@ with tab1:
                         'p_verification_status': 'VERIFIED'
                     }).execute()
                     
-                    st.success(f"✅ Document Processed Successfully: {data.get('projectTitle')}. You can now view Breakdown, Chat, or Maps.")
+                    st.success(f"✅ Document Processed Successfully: {data.get('projectTitle')}.")
+                    st.markdown(f"<div class='model-badge'>Processed by: {active_model}</div>", unsafe_allow_html=True)
             except Exception as e:
                 st.error(f"Processing Error: {str(e)}")
 
@@ -170,6 +207,7 @@ with tab2:
 with tab3:
     if st.session_state.doc_text:
         st.markdown("### 🤖 Chat with PC-1 Document")
+        st.markdown(f"<div class='model-badge'>Active Engine: Auto-Routed</div>", unsafe_allow_html=True)
         
         for msg in st.session_state.chat_history:
             css_class = "chat-bubble-user" if msg["role"] == "user" else "chat-bubble-ai"
@@ -183,13 +221,13 @@ with tab3:
             with st.spinner("AI is thinking..."):
                 try:
                     chat_prompt = f"Context from official government document:\n{st.session_state.doc_text}\n\nUser Question: {user_input}\nAnswer professionally and concisely based ONLY on the provided context."
-                    chat_response = client.models.generate_content(
-                        model='gemini-1.5-flash', 
-                        contents=chat_prompt
-                    )
-                    reply = chat_response.text
                     
-                    st.session_state.chat_history.append({"role": "ai", "content": reply})
+                    # Uses Fallback Engine for Chat
+                    reply_text, active_model = generate_with_fallback(client, chat_prompt)
+                    
+                    # Append model name signature to AI reply so you know who answered
+                    final_reply = f"{reply_text}\n\n*(Answered by: {active_model})*"
+                    st.session_state.chat_history.append({"role": "ai", "content": final_reply})
                     st.rerun()
                 except Exception as e:
                     st.error(f"Chat Error: {str(e)}")
