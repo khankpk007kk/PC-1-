@@ -8,8 +8,8 @@ from supabase import create_client, Client
 import PyPDF2
 import base64
 import os
-import openai
-import anthropic
+import urllib.request
+import urllib.error
 
 st.set_page_config(page_title="PC-1-2 Solution Hub", layout="wide", initial_sidebar_state="collapsed")
 
@@ -71,78 +71,74 @@ except Exception:
     st.error("⚠️ Secrets missing! Please set UNIVERSAL_API_KEY and Supabase credentials.")
     st.stop()
 
-# --- UNIVERSAL AI ROUTER (FIXED FOR CLAUDE API) ---
+# --- UNIVERSAL DIRECT HTTP REST ROUTER (BYPASSES SDK LOCKS) ---
 def run_ai_engine(prompt, document_text="", is_json=False):
+    full_content = prompt + ("\n\n" + document_text if document_text else "")
+    if is_json:
+        full_content += "\n\nCRITICAL: Return strictly valid JSON format matching this structure: {\"projectTitle\": \"str\", \"departmentName\": \"str\", \"totalBudget\": 0, \"components\": [{\"name\": \"str\", \"cost\": 0}], \"districtWiseAllocation\": [{\"district\": \"str\", \"amount\": 0, \"latitude\": 0.0, \"longitude\": 0.0}]}"
+
+    # Target models requested by user
+    models_to_test = [
+        "claude-opus-5-thinking",
+        "claude-opus-5",
+        "claude-opus-4-8-thinking",
+        "claude-opus-4-8",
+        "gpt-4o",
+        "gpt-3.5-turbo"
+    ]
+
+    # Decide API Base URL based on key prefix
     if API_KEY.startswith("sk-ant-"):
-        engine_name = "Anthropic Claude"
-        client = anthropic.Anthropic(api_key=API_KEY)
-        
-        # Aapke bataye hue models ki list fallback ke sath
-        claude_models = [
-            "claude-opus-5-thinking",
-            "claude-opus-5",
-            "claude-opus-4-8-thinking",
-            "claude-opus-4-8",
-            "claude-3-5-sonnet-20241022" # Fallback standard model agar custom name API reject kare
-        ]
-        
-        full_content = prompt + ("\n\n" + document_text if document_text else "")
-        if is_json:
-            full_content += "\n\nCRITICAL: Return ONLY valid JSON format matching this structure: {\"projectTitle\": \"str\", \"departmentName\": \"str\", \"totalBudget\": 0, \"components\": [{\"name\": \"str\", \"cost\": 0}], \"districtWiseAllocation\": [{\"district\": \"str\", \"amount\": 0, \"latitude\": 0.0, \"longitude\": 0.0}]}"
-
-        response = None
-        used_model = claude_models[0]
-        for m in claude_models:
-            try:
-                response = client.messages.create(
-                    model=m,
-                    max_tokens=4000,
-                    messages=[{"role": "user", "content": full_content}]
-                )
-                used_model = m
-                break
-            except Exception as e:
-                continue
-                
-        if not response:
-            raise Exception("Anthropic API error: Check your API key permissions or model availability.")
-            
-        result_text = response.content[0].text
-        return result_text, f"{engine_name} ({used_model})"
-
-    elif API_KEY.startswith("sk-"):
-        engine_name = "OpenAI (GPT)"
-        client = openai.OpenAI(api_key=API_KEY)
-        messages = [{"role": "system", "content": "You are a Financial Auditor for KPK Government."}]
-        
-        if is_json:
-            messages.append({"role": "user", "content": prompt + "\n\n" + document_text + "\nReturn strictly JSON."})
-            response = client.chat.completions.create(
-                model="gpt-3.5-turbo",
-                response_format={ "type": "json_object" },
-                messages=messages,
-                temperature=0.1
-            )
-            return response.choices[0].message.content, engine_name
-        else:
-            messages.append({"role": "user", "content": prompt + "\n\n" + document_text})
-            response = client.chat.completions.create(model="gpt-3.5-turbo", messages=messages)
-            return response.choices[0].message.content, engine_name
-
-    elif API_KEY.startswith("AIza"):
-        engine_name = "Google Gemini"
-        client = genai.Client(api_key=API_KEY)
-        response = client.models.generate_content(model='gemini-1.5-flash', contents=prompt + "\n\n" + document_text)
-        return response.text, engine_name
+        url = "https://api.anthropic.com/v1/messages"
+        headers = {
+            "x-api-key": API_KEY,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json"
+        }
     else:
-        raise ValueError("Invalid API Key format.")
+        # Standard OpenAI / Third-party Gateway endpoint
+        url = "https://api.openai.com/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {API_KEY}",
+            "content-type": "application/json"
+        }
+
+    last_err = ""
+    for model_name in models_to_test:
+        try:
+            if API_KEY.startswith("sk-ant-"):
+                payload = {
+                    "model": model_name,
+                    "max_tokens": 4000,
+                    "messages": [{"role": "user", "content": full_content}]
+                }
+                req = urllib.request.Request(url, data=json.dumps(payload).encode('utf-8'), headers=headers)
+                with urllib.request.urlopen(req) as resp:
+                    res_data = json.loads(resp.read().decode('utf-8'))
+                    text_result = res_data['content'][0]['text']
+                    return text_result, f"Custom API ({model_name})"
+            else:
+                payload = {
+                    "model": model_name,
+                    "messages": [{"role": "user", "content": full_content}]
+                }
+                req = urllib.request.Request(url, data=json.dumps(payload).encode('utf-8'), headers=headers)
+                with urllib.request.urlopen(req) as resp:
+                    res_data = json.loads(resp.read().decode('utf-8'))
+                    text_result = res_data['choices'][0]['message']['content']
+                    return text_result, f"Custom API ({model_name})"
+        except Exception as e:
+            last_err = str(e)
+            continue
+
+    raise Exception(f"All models failed on this API key via direct REST. Error: {last_err}")
 
 tab1, tab2, tab3, tab4, tab5 = st.tabs(["📤 Upload PDF", "📊 PC-1 Breakdown", "💬 AI Chat", "📝 DB & Comments", "🗺️ Maps"])
 
 with tab1:
     uploaded_file = st.file_uploader("Upload PC-1 / PC-2 Document (PDF Format)", type=['pdf'])
     if uploaded_file and st.button("🚀 Process & Secure Document"):
-        with st.spinner("Processing via Claude AI..."):
+        with st.spinner("Processing via Custom API Gateway..."):
             try:
                 reader = PyPDF2.PdfReader(uploaded_file)
                 extracted_text = "\n".join([page.extract_text() for page in reader.pages if page.extract_text()])
