@@ -110,7 +110,7 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs(["📤 Upload PDF", "📊 PC-1 Breakdown"
 with tab1:
     uploaded_file = st.file_uploader("Upload PC-1 / PC-2 Document (PDF Format)", type=['pdf'])
     if uploaded_file and st.button("🚀 Process & Secure Document"):
-        with st.spinner("Extracting & Analyzing with Gemini 1.5 Pro..."):
+        with st.spinner("Extracting & Analyzing with Gemini 1.5 Flash..."):
             try:
                 reader = PyPDF2.PdfReader(uploaded_file)
                 extracted_text = "\n".join([page.extract_text() for page in reader.pages if page.extract_text()])
@@ -122,7 +122,7 @@ with tab1:
                     
                     prompt = "Parse this PC-1 form. Extract title, department, total budget, breakdown of components, and district allocations with coordinates."
                     response = client.models.generate_content(
-                        model='gemini-1.5-pro',
+                        model='gemini-1.5-flash',
                         contents=[prompt, extracted_text],
                         config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=pc1_schema, temperature=0.1)
                     )
@@ -184,7 +184,7 @@ with tab3:
                 try:
                     chat_prompt = f"Context from official government document:\n{st.session_state.doc_text}\n\nUser Question: {user_input}\nAnswer professionally and concisely based ONLY on the provided context."
                     chat_response = client.models.generate_content(
-                        model='gemini-1.5-pro', 
+                        model='gemini-1.5-flash', 
                         contents=chat_prompt
                     )
                     reply = chat_response.text
