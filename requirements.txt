@@ -6,3 +6,4 @@ streamlit-folium
 pydantic
 PyPDF2
 openai
+anthropic
