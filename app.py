@@ -105,7 +105,7 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs(["📤 Upload PDF", "📊 PC-1 Breakdown"
 with tab1:
     uploaded_file = st.file_uploader("Upload PC-1 / PC-2 Document (PDF Format)", type=['pdf'])
     if uploaded_file and st.button("🚀 Process & Secure Document"):
-        with st.spinner("Processing via Google Gemini 1.5 Flash..."):
+        with st.spinner("Processing via Google Gemini 3.7..."):
             try:
                 reader = PyPDF2.PdfReader(uploaded_file)
                 extracted_text = "\n".join([page.extract_text() for page in reader.pages if page.extract_text()])
@@ -116,12 +116,12 @@ with tab1:
                     prompt = "Parse this PC-1 form. Extract title, department, total budget, breakdown of components, and district allocations with coordinates."
                     
                     response = client.models.generate_content(
-                        model='gemini-1.5-flash',
+                        model='gemini-3.7-flash',
                         contents=[prompt, extracted_text],
                         config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=pc1_schema, temperature=0.1)
                     )
                     
-                    st.session_state.active_engine = "Google Gemini (1.5 Flash)"
+                    st.session_state.active_engine = "Google Gemini (3.7)"
                     data = json.loads(response.text)
                     st.session_state.doc_data = data
                     
@@ -136,7 +136,7 @@ with tab1:
                     }).execute()
                     
                     st.success("✅ Document Processed Successfully!")
-                    st.markdown(f"<div class='engine-badge'>Powered by: Google Gemini (1.5 Flash)</div>", unsafe_allow_html=True)
+                    st.markdown(f"<div class='engine-badge'>Powered by: Google Gemini (3.7)</div>", unsafe_allow_html=True)
             except Exception as e:
                 st.error(f"Processing Error: {str(e)}")
 
@@ -167,7 +167,7 @@ with tab3:
             with st.spinner("AI is thinking..."):
                 try:
                     chat_prompt = f"Context: {st.session_state.doc_text}\n\nQuestion: {user_input}\nAnswer strictly based on context."
-                    chat_resp = client.models.generate_content(model='gemini-1.5-flash', contents=chat_prompt)
+                    chat_resp = client.models.generate_content(model='gemini-3.7-flash', contents=chat_prompt)
                     st.session_state.chat_history.append({"role": "ai", "content": chat_resp.text})
                     st.rerun()
                 except Exception as e:
