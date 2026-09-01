@@ -2,8 +2,7 @@ import streamlit as st
 import json
 import folium
 from streamlit_folium import st_folium
-from google import genai
-from google.genai import types
+from groq import Groq
 from supabase import create_client, Client
 import PyPDF2
 import base64
@@ -64,48 +63,19 @@ st.markdown(f"""
 try:
     supabase: Client = create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
     DB_SECRET = st.secrets["DB_SECRET_KEY"]
-    API_KEY = st.secrets["UNIVERSAL_API_KEY"]
+    GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
 except Exception:
-    st.error("⚠️ Secrets missing! Please set UNIVERSAL_API_KEY and Supabase credentials.")
+    st.error("⚠️ Secrets missing! Please set GROQ_API_KEY and Supabase credentials in Streamlit settings.")
     st.stop()
 
-client = genai.Client(api_key=API_KEY)
-
-pc1_schema = types.Schema(
-    type=types.Type.OBJECT,
-    properties={
-        "projectTitle": types.Schema(type=types.Type.STRING),
-        "departmentName": types.Schema(type=types.Type.STRING),
-        "totalBudget": types.Schema(type=types.Type.NUMBER),
-        "components": types.Schema(
-            type=types.Type.ARRAY,
-            items=types.Schema(
-                type=types.Type.OBJECT,
-                properties={"name": types.Schema(type=types.Type.STRING), "cost": types.Schema(type=types.Type.NUMBER)}
-            )
-        ),
-        "districtWiseAllocation": types.Schema(
-            type=types.Type.ARRAY,
-            items=types.Schema(
-                type=types.Type.OBJECT,
-                properties={
-                    "district": types.Schema(type=types.Type.STRING),
-                    "amount": types.Schema(type=types.Type.NUMBER),
-                    "latitude": types.Schema(type=types.Type.NUMBER),
-                    "longitude": types.Schema(type=types.Type.NUMBER)
-                }
-            )
-        )
-    },
-    required=["projectTitle", "departmentName", "totalBudget", "components", "districtWiseAllocation"]
-)
+groq_client = Groq(api_key=GROQ_API_KEY)
 
 tab1, tab2, tab3, tab4, tab5 = st.tabs(["📤 Upload PDF", "📊 PC-1 Breakdown", "💬 AI Chat", "📝 DB & Comments", "🗺️ Maps"])
 
 with tab1:
     uploaded_file = st.file_uploader("Upload PC-1 / PC-2 Document (PDF Format)", type=['pdf'])
     if uploaded_file and st.button("🚀 Process & Secure Document"):
-        with st.spinner("Processing via Google Gemini 3.7..."):
+        with st.spinner("Processing instantly via Groq AI (LPU Engine)..."):
             try:
                 reader = PyPDF2.PdfReader(uploaded_file)
                 extracted_text = "\n".join([page.extract_text() for page in reader.pages if page.extract_text()])
@@ -113,16 +83,31 @@ with tab1:
                     st.error("Text extraction failed.")
                 else:
                     st.session_state.doc_text = extracted_text
-                    prompt = "Parse this PC-1 form. Extract title, department, total budget, breakdown of components, and district allocations with coordinates."
                     
-                    response = client.models.generate_content(
-                        model='gemini-3.7-flash',
-                        contents=[prompt, extracted_text],
-                        config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=pc1_schema, temperature=0.1)
+                    prompt = """Parse this PC-1 document text. Extract project title, department name, total budget (as number), 
+                    breakdown of components (name and cost), and district allocations with district name, amount, and approximate latitude/longitude coordinates for KPK districts.
+                    Return ONLY valid JSON format matching this structure:
+                    {
+                      "projectTitle": "string",
+                      "departmentName": "string",
+                      "totalBudget": 0,
+                      "components": [{"name": "string", "cost": 0}],
+                      "districtWiseAllocation": [{"district": "string", "amount": 0, "latitude": 0.0, "longitude": 0.0}]
+                    }"""
+                    
+                    response = groq_client.chat.completions.create(
+                        model="llama-3.3-70b-versatile",
+                        messages=[
+                            {"role": "system", "content": "You are a precise financial document parser. Output strict JSON only."},
+                            {"role": "user", "content": f"{prompt}\n\nDocument Text:\n{extracted_text}"}
+                        ],
+                        response_format={"type": "json_object"},
+                        temperature=0.1
                     )
                     
-                    st.session_state.active_engine = "Google Gemini (3.7)"
-                    data = json.loads(response.text)
+                    st.session_state.active_engine = "Groq (llama-3.3-70b-versatile)"
+                    result_text = response.choices[0].message.content
+                    data = json.loads(result_text)
                     st.session_state.doc_data = data
                     
                     supabase.rpc('insert_secure_pc1', {
@@ -135,8 +120,8 @@ with tab1:
                         'p_verification_status': 'VERIFIED'
                     }).execute()
                     
-                    st.success("✅ Document Processed Successfully!")
-                    st.markdown(f"<div class='engine-badge'>Powered by: Google Gemini (3.7)</div>", unsafe_allow_html=True)
+                    st.success("✅ Document Processed Successfully via Groq!")
+                    st.markdown(f"<div class='engine-badge'>Powered by: Groq LPU (llama-3.3-70b)</div>", unsafe_allow_html=True)
             except Exception as e:
                 st.error(f"Processing Error: {str(e)}")
 
@@ -164,11 +149,17 @@ with tab3:
         if user_input:
             st.session_state.chat_history.append({"role": "user", "content": user_input})
             st.markdown(f'<div class="chat-bubble-user"><b>You:</b> {user_input}</div>', unsafe_allow_html=True)
-            with st.spinner("AI is thinking..."):
+            with st.spinner("Groq is thinking at lightning speed..."):
                 try:
-                    chat_prompt = f"Context: {st.session_state.doc_text}\n\nQuestion: {user_input}\nAnswer strictly based on context."
-                    chat_resp = client.models.generate_content(model='gemini-3.7-flash', contents=chat_prompt)
-                    st.session_state.chat_history.append({"role": "ai", "content": chat_resp.text})
+                    chat_resp = groq_client.chat.completions.create(
+                        model="llama-3.3-70b-versatile",
+                        messages=[
+                            {"role": "system", "content": "You are a professional financial auditor for the KPK Government. Answer questions strictly based on the provided document context."},
+                            {"role": "user", "content": f"Document Context:\n{st.session_state.doc_text}\n\nQuestion: {user_input}"}
+                        ]
+                    )
+                    reply_text = chat_resp.choices[0].message.content
+                    st.session_state.chat_history.append({"role": "ai", "content": reply_text})
                     st.rerun()
                 except Exception as e:
                     st.error(f"Chat Error: {str(e)}")
