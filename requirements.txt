@@ -1,9 +1,7 @@
 streamlit
-google-genai
 supabase
 folium
 streamlit-folium
 pydantic
 PyPDF2
-openai
-anthropic
+groq
