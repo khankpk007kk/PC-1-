@@ -5,95 +5,41 @@ from streamlit_folium import st_folium
 from google import genai
 from google.genai import types
 from supabase import create_client, Client
+import PyPDF2
+import io
 
-# --- PAGE CONFIGURATION ---
-st.set_page_config(page_title="KP Secretariat Dashboard", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="KP Secretariat Dashboard", layout="wide", initial_sidebar_state="expanded")
 
-# --- CUSTOM CSS (PREMIUM DARK THEME) ---
+# --- CUSTOM CSS ---
 st.markdown("""
 <style>
-    /* Main background */
     .stApp { background-color: #0f172a; color: #f8fafc; }
-    
-    /* Premium Header Card */
-    .glass-card {
-        background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%);
-        border-left: 4px solid #10b981;
-        padding: 20px;
-        border-radius: 10px;
-        box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.3);
-        margin-bottom: 24px;
-    }
-    
-    /* Metrics Styling */
-    .metric-value { color: #10b981; font-size: 2.2rem; font-weight: bold; margin-top: 10px; }
-    .metric-title { color: #94a3b8; font-size: 1rem; text-transform: uppercase; letter-spacing: 1px; }
-    
-    /* Fix Label Visibility */
-    .stTextArea label { 
-        color: #94a3b8 !important; 
-        font-size: 15px !important; 
-        font-weight: 500 !important; 
-    }
-    
-    /* Fix Text Area Box to Dark Theme */
-    .stTextArea textarea {
-        background-color: #1e293b !important;
-        color: #f8fafc !important;
-        border: 1px solid #334155 !important;
-        border-radius: 8px !important;
-    }
-    .stTextArea textarea:focus { 
-        border-color: #10b981 !important; 
-        box-shadow: none !important; 
-    }
-    
-    /* Fix Button Visibility and Hover Effects */
-    .stButton button {
-        background-color: #10b981 !important;
-        color: white !important;
-        font-weight: 600 !important;
-        border-radius: 8px !important;
-        border: none !important;
-        padding: 10px 24px !important;
-        transition: all 0.3s ease;
-        width: 100%;
-    }
-    .stButton button:hover { 
-        background-color: #059669 !important; 
-        transform: scale(1.02); 
-    }
+    .glass-card { background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%); border-left: 4px solid #10b981; padding: 20px; border-radius: 10px; margin-bottom: 24px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.3); }
+    .stTabs [data-baseweb="tab-list"] { gap: 24px; }
+    .stTabs [data-baseweb="tab"] { color: #94a3b8; font-weight: 600; padding: 10px 0px; }
+    .stTabs [aria-selected="true"] { color: #10b981 !important; border-bottom: 2px solid #10b981 !important; }
+    div[data-baseweb="input"] input { background-color: #1e293b !important; color: #fff !important; }
+    .stButton button { background-color: #10b981 !important; color: white !important; font-weight: 600 !important; width: 100%; border-radius: 8px !important; border: none !important; }
+    .stButton button:hover { background-color: #059669 !important; }
 </style>
 """, unsafe_allow_html=True)
 
 # --- SECRETS & CLIENTS ---
 try:
-    SUPABASE_URL = st.secrets["SUPABASE_URL"]
-    SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
-    GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
-    DB_SECRET_KEY = st.secrets["DB_SECRET_KEY"]
-except KeyError:
-    st.error("⚠️ Secrets missing! Please check Streamlit Cloud Settings.")
+    supabase: Client = create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
+    client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
+    DB_SECRET = st.secrets["DB_SECRET_KEY"]
+except Exception:
+    st.error("⚠️ Secrets missing in Streamlit Cloud!")
     st.stop()
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-client = genai.Client(api_key=GEMINI_API_KEY)
-
-# --- GEMINI SCHEMA ---
+# --- GEMINI SCHEMA (Updated for Search/Index) ---
 pc1_schema = types.Schema(
     type=types.Type.OBJECT,
     properties={
+        "projectTitle": types.Schema(type=types.Type.STRING),
+        "departmentName": types.Schema(type=types.Type.STRING),
         "totalBudget": types.Schema(type=types.Type.NUMBER),
-        "departmentWiseFunds": types.Schema(
-            type=types.Type.ARRAY,
-            items=types.Schema(
-                type=types.Type.OBJECT,
-                properties={
-                    "department": types.Schema(type=types.Type.STRING),
-                    "allocatedAmount": types.Schema(type=types.Type.NUMBER)
-                }
-            )
-        ),
         "districtWiseAllocation": types.Schema(
             type=types.Type.ARRAY,
             items=types.Schema(
@@ -107,80 +53,115 @@ pc1_schema = types.Schema(
             )
         )
     },
-    required=["totalBudget", "departmentWiseFunds", "districtWiseAllocation"]
+    required=["projectTitle", "departmentName", "totalBudget", "districtWiseAllocation"]
 )
 
-# --- UI HEADER ---
-st.markdown('<div class="glass-card"><h2>🛡️ Civil Secretariat Peshawar - PC-1 Audit</h2><p style="color: #94a3b8; margin: 0;">Automated AI Document Verification System</p></div>', unsafe_allow_html=True)
+st.markdown('<div class="glass-card"><h2>🛡️ Civil Secretariat - Command Center</h2><p style="color: #94a3b8; margin:0;">Automated PC-1 Audit, Search & Map Analytics</p></div>', unsafe_allow_html=True)
 
-# --- INPUT SECTION ---
-document_text = st.text_area("📄 Paste Raw PC-1/PC-2 Document Text Here:", height=250, placeholder="Enter the official document text to begin analysis...")
+# --- TABS NAVIGATION ---
+tab1, tab2, tab3 = st.tabs(["📤 Upload & AI Audit", "🔍 Index & Search", "🗺️ Map-Wise Analytics"])
 
-if st.button("🚀 Analyze & Encrypt Document"):
-    if not document_text.strip():
-        st.error("Please enter document text first.")
-    else:
-        with st.spinner("Analyzing with Gemini AI & Encrypting in PostgreSQL..."):
+# ==========================================
+# TAB 1: FILE UPLOAD & AI PROCESSING
+# ==========================================
+with tab1:
+    uploaded_file = st.file_uploader("Upload PC-1 Document (PDF format)", type=['pdf'])
+    
+    if uploaded_file and st.button("🚀 Process & Secure Document"):
+        with st.spinner("Extracting text and analyzing via Gemini..."):
             try:
-                # 1. Call Gemini API
-                prompt = """You are a Financial Auditor for KPK Government. Parse this PC-1 form text.
-                Extract exact total budget, department-wise funds, and district allocations with accurate coordinates for KPK."""
+                # Read PDF
+                reader = PyPDF2.PdfReader(uploaded_file)
+                document_text = "\n".join([page.extract_text() for page in reader.pages if page.extract_text()])
                 
+                # AI Processing
+                prompt = "Parse this PC-1 form. Extract project title, department, total budget, and district allocations with exact coordinates."
                 response = client.models.generate_content(
                     model='gemini-2.5-flash',
                     contents=[prompt, document_text],
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        response_schema=pc1_schema,
-                        temperature=0.1
-                    ),
+                    config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=pc1_schema, temperature=0.1)
                 )
-                
                 data = json.loads(response.text)
                 
-                # 2. Save Securely to Supabase
+                # Database Insert
                 supabase.rpc('insert_secure_pc1', {
-                    'p_project_title': 'Automated Scan',
-                    'p_department': 'P&D',
+                    'p_project_title': data.get('projectTitle', 'Unknown Project'),
+                    'p_department': data.get('departmentName', 'Unknown Dept'),
                     'p_raw_payload': document_text,
-                    'p_secret_key': DB_SECRET_KEY,
+                    'p_secret_key': DB_SECRET,
                     'p_total_budget': data.get('totalBudget', 0),
                     'p_district_allocations': data.get('districtWiseAllocation', []),
-                    'p_verification_status': 'PENDING'
+                    'p_verification_status': 'VERIFIED'
                 }).execute()
                 
-                st.success("✅ Document Successfully Analyzed and Encrypted!")
-                
-                # --- DASHBOARD METRICS ---
-                st.markdown(f'''
-                    <div class="glass-card" style="text-align: center;">
-                        <div class="metric-title">Total Verified Budget</div>
-                        <div class="metric-value">PKR {data.get("totalBudget", 0):,}</div>
-                    </div>
-                ''', unsafe_allow_html=True)
-                
-                # --- MAP VISUALIZATION (FOLIUM) ---
-                st.subheader("📍 District Allocations Map")
-                # Default center at Peshawar
-                kp_map = folium.Map(location=[34.0151, 71.5249], zoom_start=7, tiles="CartoDB dark_matter")
-                
-                for loc in data.get('districtWiseAllocation', []):
-                    folium.CircleMarker(
-                        location=[loc.get('latitude', 34.0), loc.get('longitude', 71.5)],
-                        radius=12,
-                        popup=f"<b>{loc.get('district', 'Unknown')}</b><br>PKR {loc.get('amount', 0):,}",
-                        color="#10b981",
-                        fill=True,
-                        fill_color="#059669",
-                        fill_opacity=0.7
-                    ).add_to(kp_map)
-                
-                # Use st_folium to render the map
-                st_folium(kp_map, width=700, height=400, returned_objects=[])
-                
-                # --- PRINTABLE TABLE ---
-                st.subheader("📑 Department Allocations")
-                st.table(data.get('departmentWiseFunds', []))
-
+                st.success(f"✅ Successfully processed: {data.get('projectTitle')}")
+                st.balloons()
             except Exception as e:
-                st.error(f"System Error: {str(e)}")
+                st.error(f"Processing Error: {str(e)}")
+
+# ==========================================
+# TAB 2: INDEX-WISE SEARCH & FILTERING
+# ==========================================
+with tab2:
+    st.subheader("🔍 Search Database")
+    search_query = st.text_input("Search by Project Title or Department:", placeholder="e.g., Solarization, Education...")
+    
+    try:
+        # Fetch metadata from database (Excluding encrypted payload for speed)
+        response = supabase.table("secure_pc1").select("id, project_title, department, total_budget, verification_status, created_at").execute()
+        records = response.data
+        
+        if records:
+            # Filter Logic
+            if search_query:
+                records = [r for r in records if search_query.lower() in r['project_title'].lower() or search_query.lower() in r['department'].lower()]
+            
+            # Display as interactive dataframe
+            st.dataframe(
+                records,
+                column_config={
+                    "id": None, # Hide UUID
+                    "project_title": "Project Title",
+                    "department": "Department",
+                    "total_budget": st.column_config.NumberColumn("Total Budget (PKR)", format="%d"),
+                    "verification_status": "Status",
+                    "created_at": st.column_config.DatetimeColumn("Date Added", format="D MMM YYYY")
+                },
+                use_container_width=True,
+                hide_index=True
+            )
+        else:
+            st.info("No documents found in the database. Please upload a PC-1 first.")
+    except Exception as e:
+        st.error(f"Database Error: {str(e)}")
+
+# ==========================================
+# TAB 3: MAP-WISE ANALYTICS
+# ==========================================
+with tab3:
+    st.subheader("🗺️ Province-Wide Project Distribution")
+    try:
+        # Fetch all district allocations
+        res = supabase.table("secure_pc1").select("project_title, district_allocations").execute()
+        all_projects = res.data
+        
+        if all_projects:
+            kp_map = folium.Map(location=[34.0151, 71.5249], zoom_start=7, tiles="CartoDB dark_matter")
+            
+            for proj in all_projects:
+                title = proj.get('project_title', 'Project')
+                allocations = proj.get('district_allocations', [])
+                
+                for loc in allocations:
+                    if loc.get('latitude') and loc.get('longitude'):
+                        folium.Marker(
+                            location=[loc['latitude'], loc['longitude']],
+                            popup=f"<b>{title}</b><br>{loc.get('district')}: PKR {loc.get('amount', 0):,}",
+                            icon=folium.Icon(color="green", icon="info-sign")
+                        ).add_to(kp_map)
+            
+            st_folium(kp_map, width=1000, height=500, returned_objects=[])
+        else:
+            st.info("No mapping data available yet.")
+    except Exception as e:
+        st.error(f"Map Rendering Error: {str(e)}")
