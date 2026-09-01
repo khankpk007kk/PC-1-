@@ -8,18 +8,18 @@ from supabase import create_client, Client
 import PyPDF2
 import base64
 import os
+import openai
 
 st.set_page_config(page_title="PC-1-2 Solution Hub", layout="wide", initial_sidebar_state="collapsed")
 
-# --- INITIALIZE SESSION STATE ---
 if "doc_text" not in st.session_state:
     st.session_state.doc_text = ""
 if "doc_data" not in st.session_state:
     st.session_state.doc_data = None
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
-if "used_model" not in st.session_state:
-    st.session_state.used_model = "None"
+if "active_engine" not in st.session_state:
+    st.session_state.active_engine = "Pending"
 
 def get_base64_image(image_path):
     if os.path.exists(image_path):
@@ -30,7 +30,6 @@ def get_base64_image(image_path):
 logo_b64 = get_base64_image("kp_logo.png")
 logo_html = f'<img src="data:image/png;base64,{logo_b64}" style="height: 75px; object-fit: contain;">' if logo_b64 else '<div style="height: 75px; width: 75px; border: 1px dashed #ccc; display: flex; align-items: center; justify-content: center; font-size: 10px; color: #999;">Logo</div>'
 
-# --- CSS & PRINT STYLING ---
 st.markdown("""
 <style>
     [data-testid="stAppViewContainer"] { background-color: #F4F7F6 !important; }
@@ -41,9 +40,9 @@ st.markdown("""
     .stTabs [aria-selected="true"] { color: #059669 !important; border-bottom: 3px solid #059669 !important; }
     .stButton button { background-color: #059669 !important; color: white !important; font-weight: 700 !important; border-radius: 8px !important; border: none !important; width: 100%; transition: all 0.3s ease; }
     .stButton button:hover { background-color: #047857 !important; }
-    .chat-bubble-user { background-color: #e2e8f0; padding: 10px 15px; border-radius: 15px 15px 0 15px; margin-bottom: 10px; width: fit-content; max-width: 80%; margin-left: auto; border: 1px solid #cbd5e1; }
-    .chat-bubble-ai { background-color: #d1fae5; padding: 10px 15px; border-radius: 15px 15px 15px 0; margin-bottom: 10px; width: fit-content; max-width: 80%; border: 1px solid #a7f3d0; }
-    .model-badge { display: inline-block; padding: 4px 10px; background-color: #f1f5f9; border: 1px solid #cbd5e1; border-radius: 20px; font-size: 11px; color: #475569; margin-bottom: 10px; font-family: monospace; }
+    .chat-bubble-user { background-color: #e2e8f0; padding: 10px 15px; border-radius: 15px 15px 0 15px; margin-bottom: 10px; width: fit-content; max-width: 80%; margin-left: auto; }
+    .chat-bubble-ai { background-color: #d1fae5; padding: 10px 15px; border-radius: 15px 15px 15px 0; margin-bottom: 10px; width: fit-content; max-width: 80%; }
+    .engine-badge { display: inline-block; padding: 5px 12px; background: #e2e8f0; border-radius: 20px; font-size: 12px; font-weight: 600; color: #334155; margin-bottom: 15px; }
     @media print {
         [data-testid="stSidebar"], header, .stButton, .stTabs [data-baseweb="tab-list"], .stFileUploader, .stChatInput { display: none !important; }
         [data-testid="stAppViewContainer"] { background-color: white !important; }
@@ -52,7 +51,6 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- CUSTOM BRANDING HEADER ---
 st.markdown(f"""
 <div class="custom-header" style="display: flex; align-items: center; justify-content: space-between; background: white; padding: 20px; border-radius: 12px; box-shadow: 0 4px 10px rgba(0,0,0,0.05); border-top: 5px solid #059669; margin-bottom: 30px;">
     <div style="flex: 1;"></div>
@@ -64,104 +62,87 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
-# --- SECRETS & CLIENTS SETUP ---
 try:
     supabase: Client = create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
-    client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
     DB_SECRET = st.secrets["DB_SECRET_KEY"]
+    API_KEY = st.secrets["UNIVERSAL_API_KEY"]
 except Exception:
-    st.error("⚠️ Secrets missing! Please check Streamlit Cloud Settings.")
+    st.error("⚠️ Secrets missing! Please set UNIVERSAL_API_KEY and Supabase credentials.")
     st.stop()
 
-# --- GEMINI SCHEMA ---
-pc1_schema = types.Schema(
-    type=types.Type.OBJECT,
-    properties={
-        "projectTitle": types.Schema(type=types.Type.STRING),
-        "departmentName": types.Schema(type=types.Type.STRING),
-        "totalBudget": types.Schema(type=types.Type.NUMBER),
-        "components": types.Schema(
-            type=types.Type.ARRAY,
-            items=types.Schema(
-                type=types.Type.OBJECT,
-                properties={"name": types.Schema(type=types.Type.STRING), "cost": types.Schema(type=types.Type.NUMBER)}
+# --- UNIVERSAL AI ROUTER ---
+def run_ai_engine(prompt, document_text="", is_json=False):
+    if API_KEY.startswith("sk-"):
+        # OpenAI Engine
+        engine_name = "OpenAI (GPT-3.5/4)"
+        client = openai.OpenAI(api_key=API_KEY)
+        messages = [{"role": "system", "content": "You are a Financial Auditor for KPK Government."}]
+        
+        if is_json:
+            schema_instructions = """
+            Return strictly a JSON object with this structure:
+            {"projectTitle": "str", "departmentName": "str", "totalBudget": int, "components": [{"name": "str", "cost": int}], "districtWiseAllocation": [{"district": "str", "amount": int, "latitude": float, "longitude": float}]}
+            """
+            messages.append({"role": "system", "content": schema_instructions})
+            messages.append({"role": "user", "content": prompt + "\n\n" + document_text})
+            response = client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                response_format={ "type": "json_object" },
+                messages=messages,
+                temperature=0.1
             )
-        ),
-        "districtWiseAllocation": types.Schema(
-            type=types.Type.ARRAY,
-            items=types.Schema(
+            return response.choices[0].message.content, engine_name
+        else:
+            messages.append({"role": "user", "content": prompt + "\n\n" + document_text})
+            response = client.chat.completions.create(model="gpt-3.5-turbo", messages=messages)
+            return response.choices[0].message.content, engine_name
+
+    elif API_KEY.startswith("AIza"):
+        # Google Gemini Engine
+        engine_name = "Google Gemini (1.5 Flash)"
+        client = genai.Client(api_key=API_KEY)
+        
+        if is_json:
+            schema = types.Schema(
                 type=types.Type.OBJECT,
                 properties={
-                    "district": types.Schema(type=types.Type.STRING),
-                    "amount": types.Schema(type=types.Type.NUMBER),
-                    "latitude": types.Schema(type=types.Type.NUMBER),
-                    "longitude": types.Schema(type=types.Type.NUMBER)
-                }
+                    "projectTitle": types.Schema(type=types.Type.STRING),
+                    "departmentName": types.Schema(type=types.Type.STRING),
+                    "totalBudget": types.Schema(type=types.Type.NUMBER),
+                    "components": types.Schema(type=types.Type.ARRAY, items=types.Schema(type=types.Type.OBJECT, properties={"name": types.Schema(type=types.Type.STRING), "cost": types.Schema(type=types.Type.NUMBER)})),
+                    "districtWiseAllocation": types.Schema(type=types.Type.ARRAY, items=types.Schema(type=types.Type.OBJECT, properties={"district": types.Schema(type=types.Type.STRING), "amount": types.Schema(type=types.Type.NUMBER), "latitude": types.Schema(type=types.Type.NUMBER), "longitude": types.Schema(type=types.Type.NUMBER)}))
+                },
+                required=["projectTitle", "departmentName", "totalBudget", "components", "districtWiseAllocation"]
             )
-        )
-    },
-    required=["projectTitle", "departmentName", "totalBudget", "components", "districtWiseAllocation"]
-)
+            response = client.models.generate_content(
+                model='gemini-1.5-flash',
+                contents=[prompt, document_text],
+                config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=schema, temperature=0.1)
+            )
+            return response.text, engine_name
+        else:
+            response = client.models.generate_content(model='gemini-1.5-flash', contents=prompt + "\n\n" + document_text)
+            return response.text, engine_name
+    else:
+        raise ValueError("Invalid API Key Format. Must start with 'sk-' (OpenAI) or 'AIza' (Gemini).")
 
-# --- AUTO-ROUTING AI FALLBACK ENGINE ---
-def generate_with_fallback(client, prompt, document_text="", is_json=False, schema=None):
-    # Sequential list of free models from most advanced to most basic
-    models_to_try = [
-        'gemini-1.5-pro-latest',
-        'gemini-1.5-pro',
-        'gemini-1.5-flash',
-        'gemini-1.0-pro'
-    ]
-    
-    last_error = ""
-    for model_name in models_to_try:
-        try:
-            if is_json:
-                # 1.0-pro does not natively support structured JSON schema, so skip it for JSON tasks
-                if model_name == 'gemini-1.0-pro': continue 
-                
-                response = client.models.generate_content(
-                    model=model_name,
-                    contents=[prompt, document_text],
-                    config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=schema, temperature=0.1)
-                )
-            else:
-                response = client.models.generate_content(
-                    model=model_name, 
-                    contents=prompt
-                )
-            
-            return response.text, model_name
-            
-        except Exception as e:
-            last_error = str(e)
-            continue # If error (like 404), silently skip to the next model
-            
-    raise Exception(f"All available models failed on this API token. Last Error: {last_error}")
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["📤 Upload PDF", "📊 PC-1 Breakdown", "💬 AI Chat", "📝 DB & Comments", "🗺️ Maps"])
 
-# --- TABS NAVIGATION ---
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["📤 Upload PDF", "📊 PC-1 Breakdown", "💬 AI Chat", "📝 Database & Comments", "🗺️ Map Analytics"])
-
-# ==========================================
-# TAB 1: UPLOAD & PROCESS
-# ==========================================
 with tab1:
     uploaded_file = st.file_uploader("Upload PC-1 / PC-2 Document (PDF Format)", type=['pdf'])
     if uploaded_file and st.button("🚀 Process & Secure Document"):
-        with st.spinner("Auto-Routing to best available AI Model..."):
+        with st.spinner("Detecting API & Processing..."):
             try:
                 reader = PyPDF2.PdfReader(uploaded_file)
                 extracted_text = "\n".join([page.extract_text() for page in reader.pages if page.extract_text()])
-                
                 if not extracted_text.strip():
-                    st.error("Could not extract text. Please ensure the PDF is not a scanned image.")
+                    st.error("Text extraction failed.")
                 else:
                     st.session_state.doc_text = extracted_text
                     prompt = "Parse this PC-1 form. Extract title, department, total budget, breakdown of components, and district allocations with coordinates."
                     
-                    # Uses Fallback Engine
-                    result_text, active_model = generate_with_fallback(client, prompt, extracted_text, is_json=True, schema=pc1_schema)
-                    st.session_state.used_model = active_model
+                    result_text, engine_used = run_ai_engine(prompt, extracted_text, is_json=True)
+                    st.session_state.active_engine = engine_used
                     
                     data = json.loads(result_text)
                     st.session_state.doc_data = data
@@ -176,109 +157,72 @@ with tab1:
                         'p_verification_status': 'VERIFIED'
                     }).execute()
                     
-                    st.success(f"✅ Document Processed Successfully: {data.get('projectTitle')}.")
-                    st.markdown(f"<div class='model-badge'>Processed by: {active_model}</div>", unsafe_allow_html=True)
+                    st.success(f"✅ Document Processed Successfully!")
+                    st.markdown(f"<div class='engine-badge'>Powered by: {engine_used}</div>", unsafe_allow_html=True)
             except Exception as e:
                 st.error(f"Processing Error: {str(e)}")
 
-# ==========================================
-# TAB 2: PC-1 BREAKDOWN
-# ==========================================
 with tab2:
     if st.session_state.doc_data:
         d = st.session_state.doc_data
         col1, col2 = st.columns(2)
-        with col1:
-            st.info(f"**Project Title:**\n{d.get('projectTitle')}")
-        with col2:
-            st.success(f"**Total Budget:**\nPKR {d.get('totalBudget', 0):,}")
-            
-        st.markdown("### 📋 Component Wise Breakdown")
+        with col1: st.info(f"**Title:**\n{d.get('projectTitle')}")
+        with col2: st.success(f"**Budget:**\nPKR {d.get('totalBudget', 0):,}")
+        st.markdown("### 📋 Components")
         st.table(d.get('components', []))
-        
-        st.markdown("### 📍 District Allocations")
+        st.markdown("### 📍 Districts")
         st.table([{"District": x['district'], "Amount (PKR)": f"{x['amount']:,}"} for x in d.get('districtWiseAllocation', [])])
     else:
-        st.warning("Please upload and process a document in Tab 1 first.")
+        st.warning("Upload document first.")
 
-# ==========================================
-# TAB 3: FREE AI CHAT
-# ==========================================
 with tab3:
     if st.session_state.doc_text:
-        st.markdown("### 🤖 Chat with PC-1 Document")
-        st.markdown(f"<div class='model-badge'>Active Engine: Auto-Routed</div>", unsafe_allow_html=True)
-        
+        st.markdown(f"<div class='engine-badge'>Active Engine: {st.session_state.active_engine}</div>", unsafe_allow_html=True)
         for msg in st.session_state.chat_history:
             css_class = "chat-bubble-user" if msg["role"] == "user" else "chat-bubble-ai"
             st.markdown(f'<div class="{css_class}"><b>{"You" if msg["role"]=="user" else "AI"}:</b> {msg["content"]}</div>', unsafe_allow_html=True)
 
-        user_input = st.chat_input("Ask any question regarding the uploaded document...")
+        user_input = st.chat_input("Ask a question...")
         if user_input:
             st.session_state.chat_history.append({"role": "user", "content": user_input})
             st.markdown(f'<div class="chat-bubble-user"><b>You:</b> {user_input}</div>', unsafe_allow_html=True)
-            
             with st.spinner("AI is thinking..."):
                 try:
-                    chat_prompt = f"Context from official government document:\n{st.session_state.doc_text}\n\nUser Question: {user_input}\nAnswer professionally and concisely based ONLY on the provided context."
-                    
-                    # Uses Fallback Engine for Chat
-                    reply_text, active_model = generate_with_fallback(client, chat_prompt)
-                    
-                    # Append model name signature to AI reply so you know who answered
-                    final_reply = f"{reply_text}\n\n*(Answered by: {active_model})*"
-                    st.session_state.chat_history.append({"role": "ai", "content": final_reply})
+                    chat_prompt = f"Context: {st.session_state.doc_text}\n\nQuestion: {user_input}\nAnswer strictly based on context."
+                    reply_text, _ = run_ai_engine(chat_prompt, is_json=False)
+                    st.session_state.chat_history.append({"role": "ai", "content": reply_text})
                     st.rerun()
                 except Exception as e:
                     st.error(f"Chat Error: {str(e)}")
     else:
-        st.warning("Please upload a document first to activate AI Chat.")
+        st.warning("Upload document first.")
 
-# ==========================================
-# TAB 4: DATABASE & COMMENTS
-# ==========================================
 with tab4:
     try:
-        response = supabase.table("secure_pc1").select("id, project_title, department, total_budget").execute()
-        records = response.data
-        if records:
-            project_titles = {r['project_title']: r['id'] for r in records}
-            selected_proj = st.selectbox("Select Project to View/Add Comments:", options=list(project_titles.keys()))
-            
+        response = supabase.table("secure_pc1").select("id, project_title").execute()
+        if response.data:
+            titles = {r['project_title']: r['id'] for r in response.data}
+            selected_proj = st.selectbox("Select Project:", options=list(titles.keys()))
             if selected_proj:
-                proj_id = project_titles[selected_proj]
-                
-                # View Comments
+                proj_id = titles[selected_proj]
                 comments_res = supabase.table("pc1_comments").select("*").eq("pc1_id", proj_id).order("created_at", desc=False).execute()
-                st.markdown("#### 📝 Official Comments & Reviews")
                 if comments_res.data:
                     for c in comments_res.data:
-                        st.markdown(f"**{c['commenter_name']}** _({c['created_at'][:10]})_:<br><span style='color:#475569;'>{c['comment_text']}</span>", unsafe_allow_html=True)
+                        st.markdown(f"**{c['commenter_name']}**: {c['comment_text']}")
                         st.divider()
-                else:
-                    st.info("No comments yet.")
-                
-                # Add Comment
                 with st.form("comment_form"):
-                    c_name = st.text_input("Your Name / Designation:")
-                    c_text = st.text_area("Add Review / Comment:")
-                    if st.form_submit_button("Submit Comment"):
+                    c_name = st.text_input("Name:")
+                    c_text = st.text_area("Review:")
+                    if st.form_submit_button("Submit"):
                         if c_name and c_text:
                             supabase.table("pc1_comments").insert({"pc1_id": proj_id, "commenter_name": c_name, "comment_text": c_text}).execute()
-                            st.success("Comment Added Successfully!")
                             st.rerun()
-                        else:
-                            st.error("Please fill both name and comment fields.")
         else:
-            st.info("Database is empty. Please upload documents first.")
+            st.info("Database empty.")
     except Exception as e:
-        st.error(f"Database connection issue. Did you run the SQL query for the comments table? Error: {str(e)}")
+        pass
 
-# ==========================================
-# TAB 5: MAP ANALYTICS
-# ==========================================
 with tab5:
-    st.markdown("### 🗺️ Geographical Resource Allocation")
     try:
         res = supabase.table("secure_pc1").select("project_title, district_allocations").execute()
         if res.data:
@@ -286,13 +230,7 @@ with tab5:
             for proj in res.data:
                 for loc in proj.get('district_allocations', []):
                     if loc.get('latitude') and loc.get('longitude'):
-                        folium.Marker(
-                            location=[loc['latitude'], loc['longitude']],
-                            popup=f"<b>{proj.get('project_title')}</b><br>{loc.get('district')}: PKR {loc.get('amount', 0):,}",
-                            icon=folium.Icon(color="green", icon="info-sign")
-                        ).add_to(kp_map)
+                        folium.Marker(location=[loc['latitude'], loc['longitude']], popup=f"<b>{proj.get('project_title')}</b>").add_to(kp_map)
             st_folium(kp_map, width=1000, height=500, returned_objects=[])
-        else:
-            st.info("No mapping data available yet.")
-    except Exception as e:
-        st.error(f"Map Error: {str(e)}")
+    except Exception:
+        pass
