@@ -9,6 +9,7 @@ import PyPDF2
 import base64
 import os
 import openai
+import anthropic
 
 st.set_page_config(page_title="PC-1-2 Solution Hub", layout="wide", initial_sidebar_state="collapsed")
 
@@ -70,9 +71,46 @@ except Exception:
     st.error("⚠️ Secrets missing! Please set UNIVERSAL_API_KEY and Supabase credentials.")
     st.stop()
 
-# --- UNIVERSAL AI ROUTER ---
+# --- UNIVERSAL AI ROUTER WITH ANTHROPIC CLAUDE & THINKING MODELS ---
 def run_ai_engine(prompt, document_text="", is_json=False):
-    if API_KEY.startswith("sk-"):
+    if API_KEY.startswith("sk-ant-"):
+        # Anthropic Claude Engine (Supporting requested Opus models)
+        engine_name = "Anthropic Claude (Opus / Thinking)"
+        client = anthropic.Anthropic(api_key=API_KEY)
+        
+        # Priority list of requested Claude models with fallback sequence
+        claude_models = [
+            "claude-opus-5-thinking",
+            "claude-opus-5",
+            "claude-opus-4-8-thinking",
+            "claude-opus-4-8"
+        ]
+        
+        full_content = prompt + ("\n\n" + document_text if document_text else "")
+        if is_json:
+            full_content += "\n\nReturn strictly valid JSON matching this format: {\"projectTitle\": \"str\", \"departmentName\": \"str\", \"totalBudget\": int, \"components\": [{\"name\": \"str\", \"cost\": int}], \"districtWiseAllocation\": [{\"district\": \"str\", \"amount\": int, \"latitude\": float, \"longitude\": float}]}"
+
+        response = None
+        used_model = claude_models[0]
+        for m in claude_models:
+            try:
+                response = client.messages.create(
+                    model=m,
+                    max_tokens=4000,
+                    messages=[{"role": "user", "content": full_content}]
+                )
+                used_model = m
+                break
+            except Exception:
+                continue
+                
+        if not response:
+            raise Exception("All specified Claude models failed or are unauthorized for this API key.")
+            
+        result_text = response.content[0].text
+        return result_text, f"{engine_name} ({used_model})"
+
+    elif API_KEY.startswith("sk-"):
         # OpenAI Engine
         engine_name = "OpenAI (GPT-3.5/4)"
         client = openai.OpenAI(api_key=API_KEY)
@@ -124,14 +162,14 @@ def run_ai_engine(prompt, document_text="", is_json=False):
             response = client.models.generate_content(model='gemini-1.5-flash', contents=prompt + "\n\n" + document_text)
             return response.text, engine_name
     else:
-        raise ValueError("Invalid API Key Format. Must start with 'sk-' (OpenAI) or 'AIza' (Gemini).")
+        raise ValueError("Invalid API Key Format. Must start with 'sk-ant-' (Anthropic Claude), 'sk-' (OpenAI), or 'AIza' (Gemini).")
 
 tab1, tab2, tab3, tab4, tab5 = st.tabs(["📤 Upload PDF", "📊 PC-1 Breakdown", "💬 AI Chat", "📝 DB & Comments", "🗺️ Maps"])
 
 with tab1:
     uploaded_file = st.file_uploader("Upload PC-1 / PC-2 Document (PDF Format)", type=['pdf'])
     if uploaded_file and st.button("🚀 Process & Secure Document"):
-        with st.spinner("Detecting API & Processing..."):
+        with st.spinner("Detecting API & Processing via Universal Router..."):
             try:
                 reader = PyPDF2.PdfReader(uploaded_file)
                 extracted_text = "\n".join([page.extract_text() for page in reader.pages if page.extract_text()])
@@ -144,6 +182,12 @@ with tab1:
                     result_text, engine_used = run_ai_engine(prompt, extracted_text, is_json=True)
                     st.session_state.active_engine = engine_used
                     
+                    # Clean markdown code blocks if returned by Claude/OpenAI
+                    if "```json" in result_text:
+                        result_text = result_text.split("```json")[1].split("```")[0].strip()
+                    elif "```" in result_text:
+                        result_text = result_text.split("```")[1].split("```")[0].strip()
+
                     data = json.loads(result_text)
                     st.session_state.doc_data = data
                     
