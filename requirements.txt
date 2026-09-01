@@ -4,3 +4,4 @@ supabase
 folium
 streamlit-folium
 pydantic
+PyPDF2
