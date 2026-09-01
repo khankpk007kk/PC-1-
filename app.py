@@ -96,7 +96,7 @@ with tab1:
                     }"""
                     
                     response = groq_client.chat.completions.create(
-                        model="llama-3.1-70b-versatile",
+                        model="llama-3.3-70b-versatile",
                         messages=[
                             {"role": "system", "content": "You are a precise financial document parser. Output strict JSON only."},
                             {"role": "user", "content": f"{prompt}\n\nDocument Text:\n{extracted_text}"}
@@ -105,7 +105,7 @@ with tab1:
                         temperature=0.1
                     )
                     
-                    st.session_state.active_engine = "Groq (llama-3.1-70b-versatile)"
+                    st.session_state.active_engine = "Groq (llama-3.3-70b-versatile)"
                     result_text = response.choices[0].message.content
                     data = json.loads(result_text)
                     st.session_state.doc_data = data
@@ -121,7 +121,7 @@ with tab1:
                     }).execute()
                     
                     st.success("✅ Document Processed Successfully via Groq!")
-                    st.markdown(f"<div class='engine-badge'>Powered by: Groq (llama-3.1-70b-versatile)</div>", unsafe_allow_html=True)
+                    st.markdown(f"<div class='engine-badge'>Powered by: Groq (llama-3.3-70b-versatile)</div>", unsafe_allow_html=True)
             except Exception as e:
                 st.error(f"Processing Error: {str(e)}")
 
@@ -152,7 +152,7 @@ with tab3:
             with st.spinner("Groq is thinking at lightning speed..."):
                 try:
                     chat_resp = groq_client.chat.completions.create(
-                        model="llama-3.1-70b-versatile",
+                        model="llama-3.3-70b-versatile",
                         messages=[
                             {"role": "system", "content": "You are a professional financial auditor for the KPK Government. Answer questions strictly based on the provided document context."},
                             {"role": "user", "content": f"Document Context:\n{st.session_state.doc_text}\n\nQuestion: {user_input}"}
