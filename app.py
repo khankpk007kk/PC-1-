@@ -71,24 +71,24 @@ except Exception:
     st.error("⚠️ Secrets missing! Please set UNIVERSAL_API_KEY and Supabase credentials.")
     st.stop()
 
-# --- UNIVERSAL AI ROUTER WITH ANTHROPIC CLAUDE & THINKING MODELS ---
+# --- UNIVERSAL AI ROUTER (FIXED FOR CLAUDE API) ---
 def run_ai_engine(prompt, document_text="", is_json=False):
     if API_KEY.startswith("sk-ant-"):
-        # Anthropic Claude Engine (Supporting requested Opus models)
-        engine_name = "Anthropic Claude (Opus / Thinking)"
+        engine_name = "Anthropic Claude"
         client = anthropic.Anthropic(api_key=API_KEY)
         
-        # Priority list of requested Claude models with fallback sequence
+        # Aapke bataye hue models ki list fallback ke sath
         claude_models = [
             "claude-opus-5-thinking",
             "claude-opus-5",
             "claude-opus-4-8-thinking",
-            "claude-opus-4-8"
+            "claude-opus-4-8",
+            "claude-3-5-sonnet-20241022" # Fallback standard model agar custom name API reject kare
         ]
         
         full_content = prompt + ("\n\n" + document_text if document_text else "")
         if is_json:
-            full_content += "\n\nReturn strictly valid JSON matching this format: {\"projectTitle\": \"str\", \"departmentName\": \"str\", \"totalBudget\": int, \"components\": [{\"name\": \"str\", \"cost\": int}], \"districtWiseAllocation\": [{\"district\": \"str\", \"amount\": int, \"latitude\": float, \"longitude\": float}]}"
+            full_content += "\n\nCRITICAL: Return ONLY valid JSON format matching this structure: {\"projectTitle\": \"str\", \"departmentName\": \"str\", \"totalBudget\": 0, \"components\": [{\"name\": \"str\", \"cost\": 0}], \"districtWiseAllocation\": [{\"district\": \"str\", \"amount\": 0, \"latitude\": 0.0, \"longitude\": 0.0}]}"
 
         response = None
         used_model = claude_models[0]
@@ -101,28 +101,22 @@ def run_ai_engine(prompt, document_text="", is_json=False):
                 )
                 used_model = m
                 break
-            except Exception:
+            except Exception as e:
                 continue
                 
         if not response:
-            raise Exception("All specified Claude models failed or are unauthorized for this API key.")
+            raise Exception("Anthropic API error: Check your API key permissions or model availability.")
             
         result_text = response.content[0].text
         return result_text, f"{engine_name} ({used_model})"
 
     elif API_KEY.startswith("sk-"):
-        # OpenAI Engine
-        engine_name = "OpenAI (GPT-3.5/4)"
+        engine_name = "OpenAI (GPT)"
         client = openai.OpenAI(api_key=API_KEY)
         messages = [{"role": "system", "content": "You are a Financial Auditor for KPK Government."}]
         
         if is_json:
-            schema_instructions = """
-            Return strictly a JSON object with this structure:
-            {"projectTitle": "str", "departmentName": "str", "totalBudget": int, "components": [{"name": "str", "cost": int}], "districtWiseAllocation": [{"district": "str", "amount": int, "latitude": float, "longitude": float}]}
-            """
-            messages.append({"role": "system", "content": schema_instructions})
-            messages.append({"role": "user", "content": prompt + "\n\n" + document_text})
+            messages.append({"role": "user", "content": prompt + "\n\n" + document_text + "\nReturn strictly JSON."})
             response = client.chat.completions.create(
                 model="gpt-3.5-turbo",
                 response_format={ "type": "json_object" },
@@ -136,40 +130,19 @@ def run_ai_engine(prompt, document_text="", is_json=False):
             return response.choices[0].message.content, engine_name
 
     elif API_KEY.startswith("AIza"):
-        # Google Gemini Engine
-        engine_name = "Google Gemini (1.5 Flash)"
+        engine_name = "Google Gemini"
         client = genai.Client(api_key=API_KEY)
-        
-        if is_json:
-            schema = types.Schema(
-                type=types.Type.OBJECT,
-                properties={
-                    "projectTitle": types.Schema(type=types.Type.STRING),
-                    "departmentName": types.Schema(type=types.Type.STRING),
-                    "totalBudget": types.Schema(type=types.Type.NUMBER),
-                    "components": types.Schema(type=types.Type.ARRAY, items=types.Schema(type=types.Type.OBJECT, properties={"name": types.Schema(type=types.Type.STRING), "cost": types.Schema(type=types.Type.NUMBER)})),
-                    "districtWiseAllocation": types.Schema(type=types.Type.ARRAY, items=types.Schema(type=types.Type.OBJECT, properties={"district": types.Schema(type=types.Type.STRING), "amount": types.Schema(type=types.Type.NUMBER), "latitude": types.Schema(type=types.Type.NUMBER), "longitude": types.Schema(type=types.Type.NUMBER)}))
-                },
-                required=["projectTitle", "departmentName", "totalBudget", "components", "districtWiseAllocation"]
-            )
-            response = client.models.generate_content(
-                model='gemini-1.5-flash',
-                contents=[prompt, document_text],
-                config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=schema, temperature=0.1)
-            )
-            return response.text, engine_name
-        else:
-            response = client.models.generate_content(model='gemini-1.5-flash', contents=prompt + "\n\n" + document_text)
-            return response.text, engine_name
+        response = client.models.generate_content(model='gemini-1.5-flash', contents=prompt + "\n\n" + document_text)
+        return response.text, engine_name
     else:
-        raise ValueError("Invalid API Key Format. Must start with 'sk-ant-' (Anthropic Claude), 'sk-' (OpenAI), or 'AIza' (Gemini).")
+        raise ValueError("Invalid API Key format.")
 
 tab1, tab2, tab3, tab4, tab5 = st.tabs(["📤 Upload PDF", "📊 PC-1 Breakdown", "💬 AI Chat", "📝 DB & Comments", "🗺️ Maps"])
 
 with tab1:
     uploaded_file = st.file_uploader("Upload PC-1 / PC-2 Document (PDF Format)", type=['pdf'])
     if uploaded_file and st.button("🚀 Process & Secure Document"):
-        with st.spinner("Detecting API & Processing via Universal Router..."):
+        with st.spinner("Processing via Claude AI..."):
             try:
                 reader = PyPDF2.PdfReader(uploaded_file)
                 extracted_text = "\n".join([page.extract_text() for page in reader.pages if page.extract_text()])
@@ -182,7 +155,6 @@ with tab1:
                     result_text, engine_used = run_ai_engine(prompt, extracted_text, is_json=True)
                     st.session_state.active_engine = engine_used
                     
-                    # Clean markdown code blocks if returned by Claude/OpenAI
                     if "```json" in result_text:
                         result_text = result_text.split("```json")[1].split("```")[0].strip()
                     elif "```" in result_text:
@@ -201,7 +173,7 @@ with tab1:
                         'p_verification_status': 'VERIFIED'
                     }).execute()
                     
-                    st.success(f"✅ Document Processed Successfully!")
+                    st.success("✅ Document Processed Successfully!")
                     st.markdown(f"<div class='engine-badge'>Powered by: {engine_used}</div>", unsafe_allow_html=True)
             except Exception as e:
                 st.error(f"Processing Error: {str(e)}")
