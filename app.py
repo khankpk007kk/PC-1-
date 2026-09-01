@@ -9,10 +9,16 @@ import PyPDF2
 import base64
 import os
 
-# --- PAGE CONFIGURATION (LIGHT THEME FORCED) ---
 st.set_page_config(page_title="PC-1-2 Solution Hub", layout="wide", initial_sidebar_state="collapsed")
 
-# --- LOAD LOGO FOR UI & PRINT ---
+# --- INITIALIZE SESSION STATE ---
+if "doc_text" not in st.session_state:
+    st.session_state.doc_text = ""
+if "doc_data" not in st.session_state:
+    st.session_state.doc_data = None
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+
 def get_base64_image(image_path):
     if os.path.exists(image_path):
         with open(image_path, "rb") as img_file:
@@ -20,47 +26,29 @@ def get_base64_image(image_path):
     return None
 
 logo_b64 = get_base64_image("kp_logo.png")
-logo_html = f'<img src="data:image/png;base64,{logo_b64}" style="height: 75px; object-fit: contain;">' if logo_b64 else '<div style="height: 75px; width: 75px; border: 1px dashed #ccc; display: flex; align-items: center; justify-content: center; font-size: 10px; color: #999;">Logo<br>Missing</div>'
+logo_html = f'<img src="data:image/png;base64,{logo_b64}" style="height: 75px; object-fit: contain;">' if logo_b64 else '<div style="height: 75px; width: 75px; border: 1px dashed #ccc; display: flex; align-items: center; justify-content: center; font-size: 10px; color: #999;">Logo</div>'
 
-# --- PROFESSIONAL LIGHT CSS & PRINT LAYOUT ---
 st.markdown("""
 <style>
-    /* Force Light Theme Colors */
     [data-testid="stAppViewContainer"] { background-color: #F4F7F6 !important; }
     [data-testid="stHeader"] { background-color: transparent !important; }
     p, h1, h2, h3, h4, h5, h6, span, div, label { color: #1e293b !important; }
-    
-    /* Clean Tabs Styling */
-    .stTabs [data-baseweb="tab-list"] { background-color: #ffffff; padding: 5px 15px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); gap: 20px; }
+    .stTabs [data-baseweb="tab-list"] { background-color: #ffffff; padding: 5px 15px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); gap: 15px; }
     .stTabs [data-baseweb="tab"] { color: #64748b !important; font-weight: 600; padding: 12px 0px; }
     .stTabs [aria-selected="true"] { color: #059669 !important; border-bottom: 3px solid #059669 !important; }
+    .stButton button { background-color: #059669 !important; color: white !important; font-weight: 700 !important; border-radius: 8px !important; border: none !important; width: 100%; transition: all 0.3s ease; }
+    .stButton button:hover { background-color: #047857 !important; }
+    .chat-bubble-user { background-color: #e2e8f0; padding: 10px 15px; border-radius: 15px 15px 0 15px; margin-bottom: 10px; width: fit-content; max-width: 80%; margin-left: auto; }
+    .chat-bubble-ai { background-color: #d1fae5; padding: 10px 15px; border-radius: 15px 15px 15px 0; margin-bottom: 10px; width: fit-content; max-width: 80%; }
     
-    /* File Uploader Fix */
-    [data-testid="stFileUploadDropzone"] { background-color: #ffffff !important; border: 2px dashed #cbd5e1 !important; border-radius: 12px !important; }
-    [data-testid="stFileUploadDropzone"]:hover { border-color: #059669 !important; background-color: #f0fdf4 !important; }
-    
-    /* Input Fields */
-    div[data-baseweb="input"] input { background-color: #ffffff !important; color: #1e293b !important; border: 1px solid #cbd5e1 !important; border-radius: 6px !important; }
-    div[data-baseweb="input"]:focus-within { border-color: #059669 !important; }
-    
-    /* Beautiful Buttons */
-    .stButton button { background-color: #059669 !important; color: white !important; font-weight: 700 !important; width: 100%; border-radius: 8px !important; border: none !important; padding: 12px 24px !important; box-shadow: 0 4px 6px rgba(5, 150, 105, 0.2) !important; transition: all 0.3s ease; }
-    .stButton button:hover { background-color: #047857 !important; transform: translateY(-2px); box-shadow: 0 6px 8px rgba(5, 150, 105, 0.3) !important; }
-
-    /* CSS FOR PRINTING PDF LATER */
     @media print {
-        /* Hide UI controls during print */
-        [data-testid="stSidebar"], header, .stButton, .stTabs [data-baseweb="tab-list"], [data-testid="stFileUploadDropzone"] { display: none !important; }
-        /* Clean white background for paper */
+        [data-testid="stSidebar"], header, .stButton, .stTabs [data-baseweb="tab-list"], .stFileUploader { display: none !important; }
         [data-testid="stAppViewContainer"] { background-color: white !important; }
-        /* Custom Header styling for print */
-        .custom-header { box-shadow: none !important; border-bottom: 2px solid #059669 !important; border-top: none !important; margin-bottom: 20px !important; }
-        .page-break { page-break-before: always; }
+        .custom-header { border-bottom: 2px solid #059669 !important; margin-bottom: 20px !important; }
     }
 </style>
 """, unsafe_allow_html=True)
 
-# --- CUSTOM BRANDING HEADER ---
 st.markdown(f"""
 <div class="custom-header" style="display: flex; align-items: center; justify-content: space-between; background: white; padding: 20px; border-radius: 12px; box-shadow: 0 4px 10px rgba(0,0,0,0.05); border-top: 5px solid #059669; margin-bottom: 30px;">
     <div style="flex: 1;"></div>
@@ -68,28 +56,31 @@ st.markdown(f"""
         <h1 style="color: #059669; margin: 0; font-size: 28px; font-weight: 900; letter-spacing: 1.5px;">PC-1-2 ALL IN ONE SOLUTION HUB</h1>
         <p style="color: #64748b; margin: 5px 0 0 0; font-size: 14px; font-weight: 700; letter-spacing: 3px;">MADE BY KALEEM</p>
     </div>
-    <div style="flex: 1; display: flex; justify-content: flex-end;">
-        {logo_html}
-    </div>
+    <div style="flex: 1; display: flex; justify-content: flex-end;">{logo_html}</div>
 </div>
 """, unsafe_allow_html=True)
 
-# --- SECRETS & CLIENTS SETUP ---
 try:
     supabase: Client = create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
     client = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
     DB_SECRET = st.secrets["DB_SECRET_KEY"]
 except Exception:
-    st.error("⚠️ Secrets missing! Please add them in Streamlit settings.")
+    st.error("⚠️ Secrets missing in Streamlit Cloud!")
     st.stop()
 
-# --- GEMINI SCHEMA ---
 pc1_schema = types.Schema(
     type=types.Type.OBJECT,
     properties={
         "projectTitle": types.Schema(type=types.Type.STRING),
         "departmentName": types.Schema(type=types.Type.STRING),
         "totalBudget": types.Schema(type=types.Type.NUMBER),
+        "components": types.Schema(
+            type=types.Type.ARRAY,
+            items=types.Schema(
+                type=types.Type.OBJECT,
+                properties={"name": types.Schema(type=types.Type.STRING), "cost": types.Schema(type=types.Type.NUMBER)}
+            )
+        ),
         "districtWiseAllocation": types.Schema(
             type=types.Type.ARRAY,
             items=types.Schema(
@@ -103,82 +94,135 @@ pc1_schema = types.Schema(
             )
         )
     },
-    required=["projectTitle", "departmentName", "totalBudget", "districtWiseAllocation"]
+    required=["projectTitle", "departmentName", "totalBudget", "components", "districtWiseAllocation"]
 )
 
-# --- TABS NAVIGATION ---
-tab1, tab2, tab3 = st.tabs(["📤 Upload & AI Audit", "🔍 Search Database", "🗺️ Map Analytics"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["📤 Upload PDF", "📊 PC-1 Breakdown", "💬 AI Chat", "📝 Database & Comments", "🗺️ Map Analytics"])
 
-# ==========================================
-# TAB 1: FILE UPLOAD
-# ==========================================
+# --- TAB 1: UPLOAD ---
 with tab1:
     uploaded_file = st.file_uploader("Upload PC-1 / PC-2 Document (PDF Format)", type=['pdf'])
-    
     if uploaded_file and st.button("🚀 Process & Secure Document"):
-        with st.spinner("Extracting text and analyzing via AI Engine..."):
+        with st.spinner("Extracting & Analyzing..."):
             try:
                 reader = PyPDF2.PdfReader(uploaded_file)
-                document_text = "\n".join([page.extract_text() for page in reader.pages if page.extract_text()])
+                extracted_text = "\n".join([page.extract_text() for page in reader.pages if page.extract_text()])
                 
-                prompt = "Parse this PC-1 form. Extract project title, department, total budget, and district allocations with exact coordinates."
-                response = client.models.generate_content(
-                    model='gemini-2.5-flash',
-                    contents=[prompt, document_text],
-                    config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=pc1_schema, temperature=0.1)
-                )
-                data = json.loads(response.text)
-                
-                supabase.rpc('insert_secure_pc1', {
-                    'p_project_title': data.get('projectTitle', 'Unknown'),
-                    'p_department': data.get('departmentName', 'Unknown'),
-                    'p_raw_payload': document_text,
-                    'p_secret_key': DB_SECRET,
-                    'p_total_budget': data.get('totalBudget', 0),
-                    'p_district_allocations': data.get('districtWiseAllocation', []),
-                    'p_verification_status': 'VERIFIED'
-                }).execute()
-                
-                st.success(f"✅ Successfully Verified & Encrypted: {data.get('projectTitle')}")
-                
-                st.markdown("### 📊 Document Summary")
-                st.table([{"Project Title": data.get('projectTitle'), "Department": data.get('departmentName'), "Total Budget (PKR)": f"{data.get('totalBudget', 0):,}"}])
+                if not extracted_text.strip():
+                    st.error("Could not extract text. Please ensure the PDF is not a scanned image.")
+                else:
+                    st.session_state.doc_text = extracted_text
+                    
+                    prompt = "Parse this PC-1 form. Extract title, department, total budget, breakdown of components, and district allocations with coordinates."
+                    response = client.models.generate_content(
+                        model='gemini-2.5-flash',
+                        contents=[prompt, extracted_text],
+                        config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=pc1_schema, temperature=0.1)
+                    )
+                    
+                    data = json.loads(response.text)
+                    st.session_state.doc_data = data
+                    
+                    supabase.rpc('insert_secure_pc1', {
+                        'p_project_title': data.get('projectTitle', 'Unknown'),
+                        'p_department': data.get('departmentName', 'Unknown'),
+                        'p_raw_payload': extracted_text,
+                        'p_secret_key': DB_SECRET,
+                        'p_total_budget': data.get('totalBudget', 0),
+                        'p_district_allocations': data.get('districtWiseAllocation', []),
+                        'p_verification_status': 'VERIFIED'
+                    }).execute()
+                    
+                    st.success(f"✅ Document Processed: {data.get('projectTitle')}. Go to other tabs to view details.")
             except Exception as e:
-                st.error(f"Error Processing Document: {str(e)}")
+                st.error(f"Error: {str(e)}")
 
-# ==========================================
-# TAB 2: SEARCH & PRINT DATA
-# ==========================================
+# --- TAB 2: BREAKDOWN ---
 with tab2:
-    search_query = st.text_input("🔍 Search Document by Title or Department:")
+    if st.session_state.doc_data:
+        d = st.session_state.doc_data
+        col1, col2 = st.columns(2)
+        with col1:
+            st.info(f"**Project Title:**\n{d.get('projectTitle')}")
+        with col2:
+            st.success(f"**Total Budget:**\nPKR {d.get('totalBudget', 0):,}")
+            
+        st.markdown("### 📋 Component Wise Breakdown")
+        st.table(d.get('components', []))
+        
+        st.markdown("### 📍 District Allocations")
+        st.table([{"District": x['district'], "Amount (PKR)": f"{x['amount']:,}"} for x in d.get('districtWiseAllocation', [])])
+    else:
+        st.warning("Please upload and process a document in Tab 1 first.")
+
+# --- TAB 3: FREE CHAT ---
+with tab3:
+    if st.session_state.doc_text:
+        st.markdown("### 🤖 Chat with PC-1 Document")
+        
+        for msg in st.session_state.chat_history:
+            css_class = "chat-bubble-user" if msg["role"] == "user" else "chat-bubble-ai"
+            st.markdown(f'<div class="{css_class}"><b>{"You" if msg["role"]=="user" else "AI"}:</b> {msg["content"]}</div>', unsafe_allow_html=True)
+
+        user_input = st.chat_input("Ask any question about the uploaded document...")
+        if user_input:
+            st.session_state.chat_history.append({"role": "user", "content": user_input})
+            st.markdown(f'<div class="chat-bubble-user"><b>You:</b> {user_input}</div>', unsafe_allow_html=True)
+            
+            with st.spinner("AI is thinking..."):
+                chat_prompt = f"Context from official document:\n{st.session_state.doc_text}\n\nUser Question: {user_input}\nAnswer professionally based ONLY on the context."
+                chat_response = client.models.generate_content(model='gemini-2.5-flash', contents=chat_prompt)
+                reply = chat_response.text
+                
+                st.session_state.chat_history.append({"role": "ai", "content": reply})
+                st.rerun()
+    else:
+        st.warning("Please upload a document first to activate AI Chat.")
+
+# --- TAB 4: DB & COMMENTS ---
+with tab4:
     try:
-        response = supabase.table("secure_pc1").select("project_title, department, total_budget, verification_status, created_at").execute()
+        response = supabase.table("secure_pc1").select("id, project_title, department, total_budget").execute()
         records = response.data
         if records:
-            if search_query:
-                records = [r for r in records if search_query.lower() in r['project_title'].lower() or search_query.lower() in r['department'].lower()]
+            project_titles = {r['project_title']: r['id'] for r in records}
+            selected_proj = st.selectbox("Select Project to View/Add Comments:", options=list(project_titles.keys()))
             
-            # Print-friendly display
-            st.dataframe(
-                records,
-                column_config={"project_title": "Project Title", "department": "Department", "total_budget": st.column_config.NumberColumn("Total Budget (PKR)", format="%d"), "verification_status": "Status", "created_at": st.column_config.DatetimeColumn("Date", format="D MMM YYYY")},
-                use_container_width=True, hide_index=True
-            )
-            st.info("💡 Tip: Press `Ctrl+P` (or Print from browser menu) to save this page as a branded PDF. The buttons will hide automatically.")
+            if selected_proj:
+                proj_id = project_titles[selected_proj]
+                
+                # Fetch Comments
+                comments_res = supabase.table("pc1_comments").select("*").eq("pc1_id", proj_id).order("created_at", desc=False).execute()
+                st.markdown("#### 📝 Official Comments")
+                if comments_res.data:
+                    for c in comments_res.data:
+                        st.markdown(f"**{c['commenter_name']}** ({c['created_at'][:10]}): {c['comment_text']}")
+                else:
+                    st.info("No comments yet.")
+                
+                # Add Comment Form
+                with st.form("comment_form"):
+                    c_name = st.text_input("Your Name/Designation:")
+                    c_text = st.text_area("Add Review / Comment:")
+                    if st.form_submit_button("Submit Comment"):
+                        if c_name and c_text:
+                            supabase.table("pc1_comments").insert({"pc1_id": proj_id, "commenter_name": c_name, "comment_text": c_text}).execute()
+                            st.success("Comment Added!")
+                            st.rerun()
+                        else:
+                            st.error("Please fill both fields.")
         else:
-            st.info("No documents found in the database.")
+            st.info("Database is empty.")
     except Exception as e:
-        st.error(f"Database Error: {str(e)}")
+        st.error("Database connection issue. Did you run the new SQL query?")
 
-# ==========================================
-# TAB 3: MAP ANALYTICS
-# ==========================================
-with tab3:
-    st.markdown("### 📍 KPK Project Allocations")
+# --- TAB 5: MAP ANALYTICS ---
+with tab5:
+    st.markdown("### 🗺️ Geographical Resource Allocation")
     try:
         res = supabase.table("secure_pc1").select("project_title, district_allocations").execute()
         if res.data:
-            kp_map = folium.Map(location=[34.0151, 71.5249], zoom_start=7, tiles="CartoDB positron") # Light map theme
+            kp_map = folium.Map(location=[34.0151, 71.5249], zoom_start=7, tiles="CartoDB positron")
             for proj in res.data:
                 for loc in proj.get('district_allocations', []):
                     if loc.get('latitude') and loc.get('longitude'):
