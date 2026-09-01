@@ -8,8 +8,6 @@ from supabase import create_client, Client
 import PyPDF2
 import base64
 import os
-import urllib.request
-import urllib.error
 
 st.set_page_config(page_title="PC-1-2 Solution Hub", layout="wide", initial_sidebar_state="collapsed")
 
@@ -71,74 +69,43 @@ except Exception:
     st.error("⚠️ Secrets missing! Please set UNIVERSAL_API_KEY and Supabase credentials.")
     st.stop()
 
-# --- UNIVERSAL DIRECT HTTP REST ROUTER (BYPASSES SDK LOCKS) ---
-def run_ai_engine(prompt, document_text="", is_json=False):
-    full_content = prompt + ("\n\n" + document_text if document_text else "")
-    if is_json:
-        full_content += "\n\nCRITICAL: Return strictly valid JSON format matching this structure: {\"projectTitle\": \"str\", \"departmentName\": \"str\", \"totalBudget\": 0, \"components\": [{\"name\": \"str\", \"cost\": 0}], \"districtWiseAllocation\": [{\"district\": \"str\", \"amount\": 0, \"latitude\": 0.0, \"longitude\": 0.0}]}"
+client = genai.Client(api_key=API_KEY)
 
-    # Target models requested by user
-    models_to_test = [
-        "claude-opus-5-thinking",
-        "claude-opus-5",
-        "claude-opus-4-8-thinking",
-        "claude-opus-4-8",
-        "gpt-4o",
-        "gpt-3.5-turbo"
-    ]
-
-    # Decide API Base URL based on key prefix
-    if API_KEY.startswith("sk-ant-"):
-        url = "https://api.anthropic.com/v1/messages"
-        headers = {
-            "x-api-key": API_KEY,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json"
-        }
-    else:
-        # Standard OpenAI / Third-party Gateway endpoint
-        url = "https://api.openai.com/v1/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {API_KEY}",
-            "content-type": "application/json"
-        }
-
-    last_err = ""
-    for model_name in models_to_test:
-        try:
-            if API_KEY.startswith("sk-ant-"):
-                payload = {
-                    "model": model_name,
-                    "max_tokens": 4000,
-                    "messages": [{"role": "user", "content": full_content}]
+pc1_schema = types.Schema(
+    type=types.Type.OBJECT,
+    properties={
+        "projectTitle": types.Schema(type=types.Type.STRING),
+        "departmentName": types.Schema(type=types.Type.STRING),
+        "totalBudget": types.Schema(type=types.Type.NUMBER),
+        "components": types.Schema(
+            type=types.Type.ARRAY,
+            items=types.Schema(
+                type=types.Type.OBJECT,
+                properties={"name": types.Schema(type=types.Type.STRING), "cost": types.Schema(type=types.Type.NUMBER)}
+            )
+        ),
+        "districtWiseAllocation": types.Schema(
+            type=types.Type.ARRAY,
+            items=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "district": types.Schema(type=types.Type.STRING),
+                    "amount": types.Schema(type=types.Type.NUMBER),
+                    "latitude": types.Schema(type=types.Type.NUMBER),
+                    "longitude": types.Schema(type=types.Type.NUMBER)
                 }
-                req = urllib.request.Request(url, data=json.dumps(payload).encode('utf-8'), headers=headers)
-                with urllib.request.urlopen(req) as resp:
-                    res_data = json.loads(resp.read().decode('utf-8'))
-                    text_result = res_data['content'][0]['text']
-                    return text_result, f"Custom API ({model_name})"
-            else:
-                payload = {
-                    "model": model_name,
-                    "messages": [{"role": "user", "content": full_content}]
-                }
-                req = urllib.request.Request(url, data=json.dumps(payload).encode('utf-8'), headers=headers)
-                with urllib.request.urlopen(req) as resp:
-                    res_data = json.loads(resp.read().decode('utf-8'))
-                    text_result = res_data['choices'][0]['message']['content']
-                    return text_result, f"Custom API ({model_name})"
-        except Exception as e:
-            last_err = str(e)
-            continue
-
-    raise Exception(f"All models failed on this API key via direct REST. Error: {last_err}")
+            )
+        )
+    },
+    required=["projectTitle", "departmentName", "totalBudget", "components", "districtWiseAllocation"]
+)
 
 tab1, tab2, tab3, tab4, tab5 = st.tabs(["📤 Upload PDF", "📊 PC-1 Breakdown", "💬 AI Chat", "📝 DB & Comments", "🗺️ Maps"])
 
 with tab1:
     uploaded_file = st.file_uploader("Upload PC-1 / PC-2 Document (PDF Format)", type=['pdf'])
     if uploaded_file and st.button("🚀 Process & Secure Document"):
-        with st.spinner("Processing via Custom API Gateway..."):
+        with st.spinner("Processing via Google Gemini 1.5 Flash..."):
             try:
                 reader = PyPDF2.PdfReader(uploaded_file)
                 extracted_text = "\n".join([page.extract_text() for page in reader.pages if page.extract_text()])
@@ -148,15 +115,14 @@ with tab1:
                     st.session_state.doc_text = extracted_text
                     prompt = "Parse this PC-1 form. Extract title, department, total budget, breakdown of components, and district allocations with coordinates."
                     
-                    result_text, engine_used = run_ai_engine(prompt, extracted_text, is_json=True)
-                    st.session_state.active_engine = engine_used
+                    response = client.models.generate_content(
+                        model='gemini-1.5-flash',
+                        contents=[prompt, extracted_text],
+                        config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=pc1_schema, temperature=0.1)
+                    )
                     
-                    if "```json" in result_text:
-                        result_text = result_text.split("```json")[1].split("```")[0].strip()
-                    elif "```" in result_text:
-                        result_text = result_text.split("```")[1].split("```")[0].strip()
-
-                    data = json.loads(result_text)
+                    st.session_state.active_engine = "Google Gemini (1.5 Flash)"
+                    data = json.loads(response.text)
                     st.session_state.doc_data = data
                     
                     supabase.rpc('insert_secure_pc1', {
@@ -170,7 +136,7 @@ with tab1:
                     }).execute()
                     
                     st.success("✅ Document Processed Successfully!")
-                    st.markdown(f"<div class='engine-badge'>Powered by: {engine_used}</div>", unsafe_allow_html=True)
+                    st.markdown(f"<div class='engine-badge'>Powered by: Google Gemini (1.5 Flash)</div>", unsafe_allow_html=True)
             except Exception as e:
                 st.error(f"Processing Error: {str(e)}")
 
@@ -201,8 +167,8 @@ with tab3:
             with st.spinner("AI is thinking..."):
                 try:
                     chat_prompt = f"Context: {st.session_state.doc_text}\n\nQuestion: {user_input}\nAnswer strictly based on context."
-                    reply_text, _ = run_ai_engine(chat_prompt, is_json=False)
-                    st.session_state.chat_history.append({"role": "ai", "content": reply_text})
+                    chat_resp = client.models.generate_content(model='gemini-1.5-flash', contents=chat_prompt)
+                    st.session_state.chat_history.append({"role": "ai", "content": chat_resp.text})
                     st.rerun()
                 except Exception as e:
                     st.error(f"Chat Error: {str(e)}")
