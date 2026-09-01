@@ -2,7 +2,7 @@ import streamlit as st
 import json
 import folium
 from streamlit_folium import st_folium
-from groq import Groq
+from openai import OpenAI
 from supabase import create_client, Client
 import PyPDF2
 import base64
@@ -63,24 +63,25 @@ st.markdown(f"""
 try:
     supabase: Client = create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
     DB_SECRET = st.secrets["DB_SECRET_KEY"]
-    GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
+    API_KEY = st.secrets.get("CUSTOM_API_KEY") or st.secrets.get("UNIVERSAL_API_KEY") or st.secrets.get("OPENAI_API_KEY")
 except Exception:
-    st.error("⚠️ Secrets missing! Please set GROQ_API_KEY and Supabase credentials in Streamlit settings.")
+    st.error("⚠️ Secrets missing! Please set your API key and Supabase credentials in Streamlit settings.")
     st.stop()
 
-groq_client = Groq(api_key=GROQ_API_KEY)
+# Initialize OpenAI client with standard/custom gateway support
+ai_client = OpenAI(api_key=API_KEY)
 
 tab1, tab2, tab3, tab4, tab5 = st.tabs(["📤 Upload PDF", "📊 PC-1 Breakdown", "💬 AI Chat", "📝 DB & Comments", "🗺️ Maps"])
 
 with tab1:
     uploaded_file = st.file_uploader("Upload PC-1 / PC-2 Document (PDF Format)", type=['pdf'])
     if uploaded_file and st.button("🚀 Process & Secure Document"):
-        with st.spinner("Processing instantly via Groq AI (LPU Engine)..."):
+        with st.spinner("Processing via Custom API Key (sk-)..."):
             try:
                 reader = PyPDF2.PdfReader(uploaded_file)
                 extracted_text = "\n".join([page.extract_text() for page in reader.pages if page.extract_text()])
                 if not extracted_text.strip():
-                    st.error("Text extraction failed.")
+                    st.error("Text extraction failed. Ensure the PDF contains readable text.")
                 else:
                     st.session_state.doc_text = extracted_text
                     
@@ -95,8 +96,8 @@ with tab1:
                       "districtWiseAllocation": [{"district": "string", "amount": 0, "latitude": 0.0, "longitude": 0.0}]
                     }"""
                     
-                    response = groq_client.chat.completions.create(
-                        model="llama-3.3-70b-versatile",
+                    response = ai_client.chat.completions.create(
+                        model="gpt-4o-mini", # Standard compatible model name handled by gateways
                         messages=[
                             {"role": "system", "content": "You are a precise financial document parser. Output strict JSON only."},
                             {"role": "user", "content": f"{prompt}\n\nDocument Text:\n{extracted_text}"}
@@ -105,7 +106,7 @@ with tab1:
                         temperature=0.1
                     )
                     
-                    st.session_state.active_engine = "Groq (llama-3.3-70b-versatile)"
+                    st.session_state.active_engine = "Custom Gateway API (sk-)"
                     result_text = response.choices[0].message.content
                     data = json.loads(result_text)
                     st.session_state.doc_data = data
@@ -120,8 +121,8 @@ with tab1:
                         'p_verification_status': 'VERIFIED'
                     }).execute()
                     
-                    st.success("✅ Document Processed Successfully via Groq!")
-                    st.markdown(f"<div class='engine-badge'>Powered by: Groq LPU (llama-3.3-70b)</div>", unsafe_allow_html=True)
+                    st.success("✅ Document Processed Successfully!")
+                    st.markdown(f"<div class='engine-badge'>Powered by: Custom Gateway API (sk-)</div>", unsafe_allow_html=True)
             except Exception as e:
                 st.error(f"Processing Error: {str(e)}")
 
@@ -149,10 +150,10 @@ with tab3:
         if user_input:
             st.session_state.chat_history.append({"role": "user", "content": user_input})
             st.markdown(f'<div class="chat-bubble-user"><b>You:</b> {user_input}</div>', unsafe_allow_html=True)
-            with st.spinner("Groq is thinking at lightning speed..."):
+            with st.spinner("AI is thinking..."):
                 try:
-                    chat_resp = groq_client.chat.completions.create(
-                        model="llama-3.3-70b-versatile",
+                    chat_resp = ai_client.chat.completions.create(
+                        model="gpt-4o-mini",
                         messages=[
                             {"role": "system", "content": "You are a professional financial auditor for the KPK Government. Answer questions strictly based on the provided document context."},
                             {"role": "user", "content": f"Document Context:\n{st.session_state.doc_text}\n\nQuestion: {user_input}"}
