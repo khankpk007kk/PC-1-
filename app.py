@@ -1,10 +1,18 @@
 """
-PC-1-2 ALL IN ONE SOLUTION HUB — fixed build (2026-09-01)
+PC-1-2 ALL IN ONE SOLUTION HUB — simple build (2026-09-01)
 
-Asal masla: Groq ne `llama-3.3-70b-versatile` ko 17 June 2026 ko deprecate kiya
-aur 16 August 2026 ko free/developer tier par band kar diya. Is liye har AI call
-400 `model_decommissioned` de rahi thi, jo purane code mein sirf
-"Processing Error: ..." ban kar dikh rahi thi.
+Is version mein PDF upload aur AI document-parsing wala poora hissa nikaal diya
+gaya hai. Sirf 4 cheezein hain aur wo teeno database se chalti hain:
+
+    📊 PC-1 Breakdown   — Supabase mein save project ka breakdown
+    💬 AI Chat          — usi project ke data par sawal-jawab
+    📝 DB & Comments    — project par comments parhna/likhna
+    🗺️ Map              — districts ke markers
+
+Kyun aasan ho gaya: chat/breakdown ab structured DB data par chalte hain (bohot
+chhota input) — is liye Groq ki 8000 tokens/minute wali limit se masla khatam.
+Column ke naam bhi khud detect hote hain, is liye table ka schema thora mukhtalif
+ho to bhi tabs khaali nahi rehte.
 """
 import base64
 import html
@@ -18,45 +26,59 @@ import folium
 import streamlit as st
 from groq import Groq
 from streamlit_folium import st_folium
-from supabase import create_client, Client
-
-try:                       # pypdf = maintained; PyPDF2 archived ho chuka hai
-    from pypdf import PdfReader
-except ImportError:
-    from PyPDF2 import PdfReader
+from supabase import create_client
 
 # ----------------------------------------------------------------- settings
+TABLE_PROJECTS = "secure_pc1"
+TABLE_COMMENTS = "pc1_comments"
+INSERT_RPC = "insert_secure_pc1"
+
 MODEL_CANDIDATES = [
-    "openai/gpt-oss-120b",          # Groq ki batai hui replacement
+    "openai/gpt-oss-120b",          # llama-3.3-70b-versatile band ho chuka hai
     "openai/gpt-oss-20b",
     "moonshotai/kimi-k2-instruct-0905",
     "meta-llama/llama-4-scout-17b-16e-instruct",
 ]
 DEAD_MODEL_HINTS = ("decommission", "deprecat", "does not exist",
                     "not found", "no longer")
-MAX_CHAT_DOC_CHARS = 12_000
+
+TPM_LIMIT = 8_000            # Groq free tier; sidebar → Diagnostics se badlega
+CHARS_PER_TOKEN = 2.2        # PC-1 numbers/tables itni tight tokenize hoti hain
+SAFETY_TOKENS = 400
+CHAT_OUTPUT_TOKENS = 800
 CHAT_MEMORY_TURNS = 4
 
-# Groq free tier ka TPM (tokens per minute) bohot chhota hai — aur Groq
-# "Requested" mein input tokens + max_tokens DONO ginta hai. Aapke org par
-# limit 8000 thi, is liye akela max_tokens=8000 hi poora budget kha gaya tha.
-TPM_LIMIT = 8_000            # Diagnostics tab se badal sakte hain
-CHARS_PER_TOKEN = 2.2        # PC-1 tables/numbers itni tight tokenize hoti hain
-SAFETY_TOKENS = 400          # system prompt + JSON overhead ka margin
-PARSE_OUTPUT_TOKENS = 1_600  # JSON jawab ke liye reserve
-CHAT_OUTPUT_TOKENS = 800
-CHUNK_OVERLAP_CHARS = 250
+# aik hi cheez ke kai mumkin column naam — pehla jo mile wahi use hota hai
+TITLE_KEYS = ("project_title", "title", "name", "scheme_name", "project_name")
+DEPT_KEYS = ("department", "department_name", "dept", "sector")
+BUDGET_KEYS = ("total_budget", "budget", "total_cost", "estimated_cost",
+               "amount", "capital_cost")
+COMP_KEYS = ("components", "component_breakdown", "cost_breakdown", "items")
+DIST_KEYS = ("district_allocations", "district_wise_allocation", "districts",
+             "district_allocation", "districtwiseallocation")
+STATUS_KEYS = ("verification_status", "status")
+CREATED_KEYS = ("created_at", "inserted_at", "timestamp", "date")
+CNAME_KEYS = ("commenter_name", "name", "author", "user_name", "commenter")
+CTEXT_KEYS = ("comment_text", "comment", "text", "review", "body", "message")
+LINK_CANDIDATES = ("pc1_id", "project_id", "secure_pc1_id", "pc1")
+NAME_ITEM_KEYS = ("name", "component", "component_name", "district",
+                  "district_name", "item", "head")
+AMOUNT_ITEM_KEYS = ("amount", "cost", "allocation", "budget", "value",
+                    "estimated_cost", "share")
 
 st.set_page_config(page_title="PC-1-2 Solution Hub", layout="wide",
-                   initial_sidebar_state="collapsed")
+                   initial_sidebar_state="expanded")
 
-for _key, _val in {"doc_text": "", "doc_data": None, "chat_history": [],
-                   "active_engine": "Pending", "working_model": None,
-                   "tpm_log": [], "tpm_limit": TPM_LIMIT}.items():
+for _key, _val in {"chat_history": [], "active_engine": "Pending",
+                   "working_model": None, "tpm_log": [],
+                   "tpm_limit": TPM_LIMIT, "link_col": None,
+                   "sel_id": None}.items():
     st.session_state.setdefault(_key, _val)
+
+
 # ----------------------------------------------------------------- helpers
 def safe_num(value, default=0):
-    """LLM kabhi budget ko '1,200 million' string bana deta hai; f"{x:,}" us par
+    """DB/AI kabhi budget ko '1,200 million' string bana deta hai; f"{x:,}" us par
     ValueError phenkta hai. Is liye har number pehle yahan se guzarta hai."""
     if isinstance(value, bool):
         return default
@@ -77,35 +99,92 @@ def money(value):
     return f"{safe_num(value):,.0f}"
 
 
-# --------------------------------------------- token budget / TPM management
-class TpmError(RuntimeError):
-    """413 / 429 — request TPM window se bari thi."""
+def pick(row, keys, default=None):
+    """Column ka naam project_title / projectTitle / PROJECT_TITLE — teeno aik
+    hi cheez hain. Underscore aur case hata kar match karte hain."""
+    if not isinstance(row, dict):
+        return default
+    flat = {str(k).lower().replace("_", "").replace(" ", ""): v
+            for k, v in row.items()}
+    for key in keys:
+        probe = key.lower().replace("_", "").replace(" ", "")
+        if probe in flat and flat[probe] not in (None, "", []):
+            return flat[probe]
+    return default
 
-    def __init__(self, message, limit=None, requested=None):
-        super().__init__(message)
-        self.limit = limit
-        self.requested = requested
+def as_items(value):
+    """Supabase ka column jsonb ho, text ho ya dict — teeno se
+    [{'name':…, 'amount':…}] banata hai. (text column par seedha for-loop
+    chalane se har CHARACTER iterate hota tha — purana blank-tab bug.)"""
+    raw = value
+    if isinstance(raw, str) and raw.strip():
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            return []
+    if isinstance(raw, dict):
+        inner = None
+        for key in ("items", "components", "districts", "allocations", "data"):
+            if isinstance(raw.get(key), list):
+                inner = raw[key]
+                break
+        if inner is None:                      # {'Civil Works': 500000} shape
+            return [{"name": str(k), "amount": safe_num(v)}
+                    for k, v in raw.items() if not isinstance(v, (dict, list))]
+        raw = inner
+    out = []
+    if isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, dict):
+                out.append({
+                    "name": str(pick(item, NAME_ITEM_KEYS, "—")),
+                    "amount": safe_num(pick(item, AMOUNT_ITEM_KEYS, 0)),
+                    "lat": safe_num(pick(item, ("latitude", "lat")), None),
+                    "lon": safe_num(pick(item, ("longitude", "lon", "lng")), None),
+                })
+            elif isinstance(item, str) and item.strip():
+                out.append({"name": item.strip(), "amount": 0,
+                            "lat": None, "lon": None})
+    return out
+
+
+def fields(row):
+    """Aik DB row se woh sab nikaal lena jo screen par dikhana hai."""
+    comps = as_items(pick(row, COMP_KEYS))
+    dists = as_items(pick(row, DIST_KEYS))
+    return {
+        "id": pick(row, ("id", "uuid", "pk")),
+        "title": str(pick(row, TITLE_KEYS, "Untitled project")),
+        "dept": str(pick(row, DEPT_KEYS, "—")),
+        "budget": safe_num(pick(row, BUDGET_KEYS, 0)),
+        "status": str(pick(row, STATUS_KEYS, "—")),
+        "created": str(pick(row, CREATED_KEYS, "") or "")[:19],
+        "components": comps,
+        "districts": dists,
+    }
+
+# ------------------------------------------------- token budget (Groq free tier)
+class TpmError(RuntimeError):
+    """413 / 429 — request 60-second token window se bari thi."""
 
 
 def parse_tpm_error(exc):
-    """Groq ke message se 'Limit 8000, Requested 19287' nikaal leta hai."""
     msg = str(exc)
-    if "rate_limit_exceeded" not in msg and "Request too large" not in msg:
-        return None
-    lim = re.search(r"Limit\s+([\d,]+)", msg)
-    req = re.search(r"Requested\s+([\d,]+)", msg)
-    return TpmError(msg,
-                    int(lim.group(1).replace(",", "")) if lim else None,
-                    int(req.group(1).replace(",", "")) if req else None)
+    if "rate_limit_exceeded" in msg or "Request too large" in msg:
+        lim = re.search(r"Limit\s+([\d,]+)", msg)
+        if lim:
+            st.session_state.tpm_limit = int(lim.group(1).replace(",", ""))
+        return TpmError(msg)
+    return None
 
 
 def estimate_tokens(text):
-    return int(len(text) / CHARS_PER_TOKEN) + 1
+    return int(len(str(text)) / CHARS_PER_TOKEN) + 1
 
 
-def input_char_budget(output_tokens):
-    """Aik request mein kitne characters bhej sakte hain. Groq 'Requested' mein
-    input tokens AUR max_tokens dono ginta hai — yahi 413 ki asal wajah thi."""
+def input_char_budget(output_tokens=CHAT_OUTPUT_TOKENS):
+    """Groq 'Requested' mein input tokens AUR max_tokens dono ginta hai —
+    yahi purane 413 error ki asal wajah thi."""
     room = st.session_state.tpm_limit - output_tokens - SAFETY_TOKENS
     return max(800, int(room * CHARS_PER_TOKEN))
 
@@ -117,126 +196,74 @@ def tpm_used():
     return sum(n for _, n in st.session_state.tpm_log)
 
 
-def tpm_wait_if_needed(planned_tokens):
-    """60-second window mein jagah na bache to khud intezar karta hai —
-    429 khaane se behtar hai."""
+def tpm_wait_if_needed(planned):
     used = tpm_used()
-    if used + planned_tokens <= st.session_state.tpm_limit:
+    if used + planned <= st.session_state.tpm_limit or not st.session_state.tpm_log:
         return
     oldest = min(t for t, _ in st.session_state.tpm_log)
     wait = max(1, int(62 - (time.time() - oldest)))
     box = st.empty()
     for left in range(wait, 0, -1):
-        box.info(f"⏳ TPM window bhar gaya ({used:,}/{st.session_state.tpm_limit:,} "
-                 f"tokens pichle minute mein) — {left}s intezar…")
+        box.info(f"⏳ Token window bhar gaya ({used:,}/"
+                 f"{st.session_state.tpm_limit:,} per minute) — {left}s intezar…")
         time.sleep(1)
     box.empty()
     tpm_used()
 
-
-def extract_json(text):
-    """JSON mode ke bawajood model kabhi markdown/extra text lapet deta hai,
-    ya max_tokens khatam hone par JSON adhoora reh jata hai."""
-    if not text or not text.strip():
-        raise ValueError("Model ne khaali jawab bheja (max_tokens ya filter issue).")
-    data = None
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", text, re.DOTALL)
-        if not match:
-            raise ValueError(f"Output JSON nahi tha. Pehle 300 chars: {text[:300]}")
-        data = json.loads(match.group(0))
-    if not isinstance(data, dict):
-        raise ValueError(f"JSON object expected tha, mila {type(data).__name__}.")
-    return data
-
-
-def as_list(value):
-    """Supabase ka column agar jsonb ke bajaye text hai to yahan str aata hai —
-    aur str par for-loop chalane se har character iterate hota hai."""
-    if isinstance(value, list):
-        return value
-    if isinstance(value, str) and value.strip():
-        try:
-            parsed = json.loads(value)
-        except json.JSONDecodeError:
-            return []
-        return parsed if isinstance(parsed, list) else []
-    return []
-
-
-def bubble(role, text):
-    css = "chat-bubble-user" if role == "user" else "chat-bubble-ai"
-    who = "You" if role == "user" else "AI"
-    body = html.escape(str(text)).replace("\n", "<br>")
-    st.markdown(f'<div class="{css}"><b>{who}:</b> {body}</div>',
-                unsafe_allow_html=True)
-def pdf_to_text(file_obj):
-    reader = PdfReader(file_obj)
-    pages = [(page.extract_text() or "") for page in reader.pages]
-    return "\n".join(p for p in pages if p.strip()), len(reader.pages)
-
-
 # ----------------------------------------------------------------- clients
 @st.cache_resource(show_spinner=False)
 def get_clients(supabase_url, supabase_key, groq_key):
-    supa = create_client(supabase_url, supabase_key)
-    groq = Groq(api_key=groq_key, timeout=90.0, max_retries=2)
-    return supa, groq
+    return (create_client(supabase_url, supabase_key),
+            Groq(api_key=groq_key, timeout=90.0, max_retries=2))
 
 
 try:
     supabase, groq_client = get_clients(st.secrets["SUPABASE_URL"],
                                         st.secrets["SUPABASE_KEY"],
                                         st.secrets["GROQ_API_KEY"])
-    DB_SECRET = st.secrets["DB_SECRET_KEY"]
 except KeyError as missing:
-    st.error(f"⚠️ Secret missing: {missing}. Streamlit settings → Secrets mein "
-             "SUPABASE_URL, SUPABASE_KEY, DB_SECRET_KEY, GROQ_API_KEY daalein.")
+    st.error(f"⚠️ Secret missing: {missing}. Streamlit → Settings → Secrets mein "
+             "SUPABASE_URL, SUPABASE_KEY, GROQ_API_KEY daalein "
+             "(project add karna ho to DB_SECRET_KEY bhi).")
     st.stop()
-except Exception as exc:                    # ghalat URL / purana SDK waghera
+except Exception as exc:
     st.error("⚠️ Client banate waqt error — asal wajah neeche hai:")
     st.exception(exc)
     st.stop()
 
+DB_SECRET = st.secrets.get("DB_SECRET_KEY", "")
+
 
 def _looks_dead(exc):
-    msg = str(exc).lower()
-    return any(hint in msg for hint in DEAD_MODEL_HINTS)
+    low = str(exc).lower()
+    return any(hint in low for hint in DEAD_MODEL_HINTS)
 
 
-def call_groq(messages, json_mode=False, max_tokens=1600, temperature=0.2):
-    """Pehla zinda model use karta hai. Model band ho jaye to khud agla try karta
-    hai. TPM window ka hisaab bhi rakhta hai aur 413/429 ko TpmError banata hai
-    taake caller text chhota kar ke dobara koshish kar sake."""
+def call_groq(messages, max_tokens=CHAT_OUTPUT_TOKENS, temperature=0.3):
+    """Pehla zinda model use karta hai; model band ho to khud agla try karta hai."""
     planned = sum(estimate_tokens(m["content"]) for m in messages) + max_tokens
     tpm_wait_if_needed(planned)
 
-    order = [m for m in MODEL_CANDIDATES]
-    working = st.session_state.get("working_model")
+    order = list(MODEL_CANDIDATES)
+    working = st.session_state.working_model
     if working in order:
         order.remove(working)
         order.insert(0, working)
 
     errors = []
     for model in order:
-        kwargs = {"model": model, "messages": messages,
-                  "temperature": temperature, "max_tokens": max_tokens}
-        if json_mode:
-            kwargs["response_format"] = {"type": "json_object"}
         try:
-            resp = groq_client.chat.completions.create(**kwargs)
+            resp = groq_client.chat.completions.create(
+                model=model, messages=messages, temperature=temperature,
+                max_tokens=max_tokens)
         except Exception as exc:
             tpm = parse_tpm_error(exc)
             if tpm is not None:
-                if tpm.limit:                     # asli limit yaad rakh lo
-                    st.session_state.tpm_limit = tpm.limit
                 st.session_state.tpm_log.append((time.time(), planned))
                 raise tpm from exc
             errors.append(f"• {model} → {exc}")
             if _looks_dead(exc):
-                continue                          # ye model mar chuka hai
+                continue                       # ye model mar chuka hai, agla dekho
             raise RuntimeError("\n".join(errors)) from exc
         used = getattr(getattr(resp, "usage", None), "total_tokens", 0) or 0
         st.session_state.tpm_log.append((time.time(), max(used, planned)))
@@ -244,57 +271,116 @@ def call_groq(messages, json_mode=False, max_tokens=1600, temperature=0.2):
         st.session_state.active_engine = f"Groq ({model})"
         return resp.choices[0].message.content
     raise RuntimeError("Koi bhi model available nahi:\n" + "\n".join(errors))
-# ----------------------------------------------------------------- branding
-def get_base64_image(image_path):
-    if os.path.exists(image_path):
-        with open(image_path, "rb") as img_file:
-            return base64.b64encode(img_file.read()).decode()
-    return None
+
+# ----------------------------------------------------------------- database
+def load_projects():
+    """select('*') — column ka naam guess nahi karte, warna
+    'column secure_pc1.project_title does not exist' par poora tab mar jata hai."""
+    try:
+        res = supabase.table(TABLE_PROJECTS).select("*").execute()
+        rows = [r for r in (res.data or []) if isinstance(r, dict)]
+        rows.sort(key=lambda r: str(pick(r, CREATED_KEYS, "")), reverse=True)
+        return rows, None
+    except Exception as exc:
+        return [], exc
 
 
-logo_b64 = get_base64_image("kp_logo.png")
-logo_html = (f'<img src="data:image/png;base64,{logo_b64}" '
-             'style="height:75px;object-fit:contain;" alt="KP Government logo">'
-             if logo_b64 else
-             '<div style="height:75px;width:75px;border:1px dashed #ccc;'
-             'display:flex;align-items:center;justify-content:center;'
-             'font-size:10px;color:#999;">Logo</div>')
+def link_column(project_id):
+    """pc1_comments mein project ka reference kis column mein hai — pc1_id,
+    project_id…? Aik dafa detect kar ke session mein yaad rakh lete hain."""
+    if st.session_state.link_col:
+        return st.session_state.link_col, None
+    last = None
+    for col in LINK_CANDIDATES:
+        try:
+            supabase.table(TABLE_COMMENTS).select("*").eq(col, project_id) \
+                .limit(1).execute()
+            st.session_state.link_col = col
+            return col, None
+        except Exception as exc:
+            last = exc
+            if "does not exist" not in str(exc).lower():
+                break                          # RLS/permission — column ka masla nahi
+    return None, last
 
-st.markdown("""
-<style>
-    [data-testid="stAppViewContainer"] { background-color: #F4F7F6 !important; }
-    [data-testid="stHeader"] { background-color: transparent !important; }
-    p, h1, h2, h3, h4, h5, h6, span, div, label { color: #1e293b !important; }
-    .stTabs [data-baseweb="tab-list"] { background-color: #ffffff; padding: 5px 15px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); gap: 15px; }
-    .stTabs [data-baseweb="tab"] { color: #64748b !important; font-weight: 600; padding: 12px 0px; }
-    .stTabs [aria-selected="true"] { color: #059669 !important; border-bottom: 3px solid #059669 !important; }
-    .stButton button { background-color: #059669 !important; color: white !important; font-weight: 700 !important; border-radius: 8px !important; border: none !important; width: 100%; transition: all 0.3s ease; }
-    .stButton button:hover { background-color: #047857 !important; }
-    .chat-bubble-user { background-color: #e2e8f0; padding: 10px 15px; border-radius: 15px 15px 0 15px; margin-bottom: 10px; width: fit-content; max-width: 80%; margin-left: auto; }
-    .chat-bubble-ai { background-color: #d1fae5; padding: 10px 15px; border-radius: 15px 15px 15px 0; margin-bottom: 10px; width: fit-content; max-width: 80%; }
-    .engine-badge { display: inline-block; padding: 5px 12px; background: #e2e8f0; border-radius: 20px; font-size: 12px; font-weight: 600; color: #334155; margin-bottom: 15px; }
-    @media print {
-        [data-testid="stSidebar"], header, .stButton, .stTabs [data-baseweb="tab-list"], .stFileUploader, .stChatInput { display: none !important; }
-        [data-testid="stAppViewContainer"] { background-color: white !important; }
-        .custom-header { border-bottom: 2px solid #059669 !important; margin-bottom: 20px !important; }
-    }
-</style>
-""", unsafe_allow_html=True)
 
-st.markdown(f"""
-<div class="custom-header" style="display:flex;align-items:center;justify-content:space-between;background:white;padding:20px;border-radius:12px;box-shadow:0 4px 10px rgba(0,0,0,0.05);border-top:5px solid #059669;margin-bottom:30px;">
-    <div style="flex:1;"></div>
-    <div style="flex:3;text-align:center;">
-        <h1 style="color:#059669;margin:0;font-size:28px;font-weight:900;letter-spacing:1.5px;">PC-1-2 ALL IN ONE SOLUTION HUB</h1>
-        <p style="color:#64748b;margin:5px 0 0 0;font-size:14px;font-weight:700;letter-spacing:3px;">MADE BY KALEEM</p>
-    </div>
-    <div style="flex:1;display:flex;justify-content:flex-end;">{logo_html}</div>
-</div>
-""", unsafe_allow_html=True)
+def load_comments(project_id):
+    col, err = link_column(project_id)
+    if not col:
+        return [], err
+    try:
+        query = supabase.table(TABLE_COMMENTS).select("*").eq(col, project_id)
+        try:                                   # created_at na ho to order chhor dein
+            res = query.order("created_at", desc=False).execute()
+        except Exception:
+            res = supabase.table(TABLE_COMMENTS).select("*") \
+                .eq(col, project_id).execute()
+        return [r for r in (res.data or []) if isinstance(r, dict)], None
+    except Exception as exc:
+        return [], exc
+
+
+def add_comment(project_id, name, text):
+    col, err = link_column(project_id)
+    if not col:
+        return err or RuntimeError("pc1_comments mein link column nahi mila.")
+    payloads = [{col: project_id, "commenter_name": name, "comment_text": text},
+                {col: project_id, "name": name, "comment": text},
+                {col: project_id, "author": name, "text": text}]
+    problems = []
+    for payload in payloads:
+        try:
+            supabase.table(TABLE_COMMENTS).insert(payload).execute()
+            return None
+        except Exception as exc:
+            problems.append(f"{list(payload)[1:]} → {exc}")
+            if "does not exist" not in str(exc).lower():
+                break                          # RLS ya NOT NULL — naam sahi tha
+    return RuntimeError("Comment insert fail hua — jo koshishein ki gayin:\n\n"
+                        + "\n\n".join(problems))
+
+def insert_project(title, dept, budget, comps, dists):
+    """Teen raste try karte hain: poora table insert → components ke baghair →
+    purana secure RPC. Jo chal jaye, uska naam wapas aata hai."""
+    base = {"project_title": title, "department": dept,
+            "total_budget": budget, "district_allocations": dists,
+            "verification_status": "MANUAL"}
+    attempts = [("table insert (components ke saath)", dict(base, components=comps)),
+                ("table insert", base)]
+    problems = []
+    for label, payload in attempts:
+        try:
+            supabase.table(TABLE_PROJECTS).insert(payload).execute()
+            return label, None
+        except Exception as exc:
+            problems.append(f"• {label} → {exc}")
+            if "does not exist" not in str(exc).lower():
+                break                          # RLS/permission — schema theek hai
+    try:
+        supabase.rpc(INSERT_RPC, {
+            "p_project_title": title, "p_department": dept,
+            "p_raw_payload": json.dumps({"components": comps,
+                                         "districts": dists}),
+            "p_secret_key": DB_SECRET,
+            "p_total_budget": budget,
+            "p_district_allocations": dists,
+            "p_verification_status": "MANUAL",
+        }).execute()
+        return f"{INSERT_RPC} RPC", None
+    except Exception as exc:
+        problems.append(f"• {INSERT_RPC} RPC → {exc}")
+    return None, RuntimeError("\n".join(problems))
+
+
+def table_columns(table):
+    try:
+        res = supabase.table(table).select("*").limit(1).execute()
+        rows = res.data or []
+        return (sorted(rows[0]) if rows else []), len(rows), None
+    except Exception as exc:
+        return [], 0, exc
+
 # ------------------------------------- KPK districts (locally, AI se nahi)
-# Approximate district-headquarter coordinates. Ye locally rakhne ke do faide:
-# AI ka output aadha ho gaya (TPM bachta hai) aur hallucinated coordinates
-# ka masla khatam.
 KPK_COORDS = {
     "peshawar": (34.0151, 71.5249), "nowshera": (34.0153, 71.9747),
     "charsadda": (34.1682, 71.7404), "mardan": (34.1989, 72.0231),
@@ -330,7 +416,7 @@ DISTRICT_ALIASES = {
     "daggar": "buner", "alpuri": "shangla", "parachinar": "kurram",
     "miranshah": "north waziristan", "wana": "upper south waziristan",
     "kalaya": "orakzai", "ghalanai": "mohmand", "khar": "bajaur",
-    "jamrud": "khyber", "judbah": "torghar",
+    "jamrud": "khyber",
 }
 
 
@@ -345,468 +431,435 @@ def district_coords(name, fallback_lat=None, fallback_lon=None):
     key = norm_district(name)
     if key in KPK_COORDS:
         return KPK_COORDS[key]
-    for known in KPK_COORDS:              # "swat valley" -> swat
-        if known in key or key in known:
+    for known in KPK_COORDS:                   # "swat valley" → swat
+        if key and (known in key or key in known):
             return KPK_COORDS[known]
     lat, lon = safe_num(fallback_lat, None), safe_num(fallback_lon, None)
     return (lat, lon) if (lat and lon) else (None, None)
 
-
-# --------------------------------- document ko TPM budget ke andar laana
-SCORE_WORDS = ("total", "cost", "budget", "million", "billion", "pkr", "rs.",
-               "component", "allocation", "district", "estimate", "phase",
-               "financial", "capital", "revenue", "scheme", "project")
-
-
-def score_block(block):
-    low = block.lower()
-    score = sum(low.count(w) * 2 for w in SCORE_WORDS)
-    score += sum(4 for d in KPK_COORDS if d in low)
-    score += sum(c.isdigit() for c in block) // 10
-    return score
+# ----------------------------------------------------------------- branding
+def get_base64_image(path):
+    if os.path.exists(path):
+        with open(path, "rb") as img:
+            return base64.b64encode(img.read()).decode()
+    return None
 
 
-def smart_extract(text, budget_chars, block_size=1200):
-    """Poora document TPM mein nahi aata. Is liye sirf wo blocks bhejte hain
-    jin mein budget/district/component ka data hai — pehla block (title aur
-    department) hamesha shamil rehta hai."""
-    if len(text) <= budget_chars:
-        return text, False
-    blocks = [text[i:i + block_size] for i in range(0, len(text), block_size)]
-    keep, total = {0}, len(blocks[0])
-    for i in sorted(range(1, len(blocks)),
-                    key=lambda j: score_block(blocks[j]), reverse=True):
-        if total + len(blocks[i]) + 8 > budget_chars:
+_logo = get_base64_image("kp_logo.png")
+logo_html = (f'<img src="data:image/png;base64,{_logo}" '
+             'style="height:70px;object-fit:contain;" alt="KP Government logo">'
+             if _logo else '')
+
+st.markdown("""
+<style>
+    [data-testid="stAppViewContainer"] { background-color: #F4F7F6 !important; }
+    [data-testid="stHeader"] { background-color: transparent !important; }
+    p, h1, h2, h3, h4, h5, h6, span, div, label { color: #1e293b !important; }
+    .stTabs [data-baseweb="tab-list"] { background-color: #ffffff; padding: 5px 15px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); gap: 15px; }
+    .stTabs [data-baseweb="tab"] { color: #64748b !important; font-weight: 600; padding: 12px 0px; }
+    .stTabs [aria-selected="true"] { color: #059669 !important; border-bottom: 3px solid #059669 !important; }
+    .stButton button { background-color: #059669 !important; color: white !important; font-weight: 700 !important; border-radius: 8px !important; border: none !important; width: 100%; }
+    .stButton button:hover { background-color: #047857 !important; }
+    .chat-bubble-user { background-color: #e2e8f0; padding: 10px 15px; border-radius: 15px 15px 0 15px; margin-bottom: 10px; width: fit-content; max-width: 85%; margin-left: auto; }
+    .chat-bubble-ai { background-color: #d1fae5; padding: 10px 15px; border-radius: 15px 15px 15px 0; margin-bottom: 10px; width: fit-content; max-width: 85%; }
+    .cmt { background:#ffffff; border-left:4px solid #059669; padding:10px 14px; border-radius:8px; margin-bottom:10px; box-shadow:0 1px 3px rgba(0,0,0,0.05); }
+    .engine-badge { display:inline-block; padding:5px 12px; background:#e2e8f0; border-radius:20px; font-size:12px; font-weight:600; margin-bottom:12px; }
+</style>
+""", unsafe_allow_html=True)
+
+st.markdown(f"""
+<div style="display:flex;align-items:center;justify-content:space-between;background:white;padding:18px;border-radius:12px;box-shadow:0 4px 10px rgba(0,0,0,0.05);border-top:5px solid #059669;margin-bottom:22px;">
+    <div style="flex:1;"></div>
+    <div style="flex:3;text-align:center;">
+        <h1 style="color:#059669;margin:0;font-size:26px;font-weight:900;letter-spacing:1.5px;">PC-1-2 ALL IN ONE SOLUTION HUB</h1>
+        <p style="color:#64748b;margin:5px 0 0 0;font-size:13px;font-weight:700;letter-spacing:3px;">MADE BY KALEEM</p>
+    </div>
+    <div style="flex:1;display:flex;justify-content:flex-end;">{logo_html}</div>
+</div>
+""", unsafe_allow_html=True)
+
+
+def bubble(role, text):
+    css = "chat-bubble-user" if role == "user" else "chat-bubble-ai"
+    who = "You" if role == "user" else "AI"
+    body = html.escape(str(text)).replace("\n", "<br>")
+    st.markdown(f'<div class="{css}"><b>{who}:</b> {body}</div>',
+                unsafe_allow_html=True)
+
+def parse_lines(blob):
+    """'Swat: 500000' jaisi lines ko [{'name':…, 'amount':…}] banata hai."""
+    items = []
+    for line in str(blob).splitlines():
+        line = line.strip(" -•\t")
+        if not line:
             continue
-        keep.add(i)
-        total += len(blocks[i]) + 8
-    return "\n[…]\n".join(blocks[i] for i in sorted(keep)), True
+        name, _, amount = line.partition(":")
+        if not _:
+            name, _, amount = line.rpartition(" ")
+        items.append({"name": (name or line).strip() or "—",
+                      "amount": safe_num(amount)})
+    return items
 
 
-def context_for_question(text, question, budget_chars):
-    """Chat ke liye sawal ke keywords wale hisse chunte hain — chhote token
-    budget mein document ke shuru ke 12k chars se kaafi behtar jawab milta hai."""
-    if len(text) <= budget_chars:
-        return text
-    words = re.findall(r"[a-zA-Z]{4,}", question.lower())[:12]
-    blocks = [text[i:i + 1200] for i in range(0, len(text), 1200)]
-
-    def rank(i):
-        low = blocks[i].lower()
-        return sum(low.count(w) * 5 for w in words) + score_block(blocks[i])
-
-    keep, total = set(), 0
-    for i in sorted(range(len(blocks)), key=rank, reverse=True):
-        if total + len(blocks[i]) + 8 > budget_chars:
-            continue
-        keep.add(i)
-        total += len(blocks[i]) + 8
-    return "\n[…]\n".join(blocks[i] for i in sorted(keep))
-
-
-def deep_chunks(text, budget_chars):
-    step = max(500, budget_chars - CHUNK_OVERLAP_CHARS)
-    return [text[i:i + budget_chars] for i in range(0, len(text), step)]
-
-
-def merge_parsed(parts):
-    """Deep mode ke kai hisson ka JSON aik mein jorta hai."""
-    out = {"projectTitle": "", "departmentName": "", "totalBudget": 0,
-           "components": [], "districtWiseAllocation": []}
-    comps, dists = {}, {}
-    for p in parts:
-        for field in ("projectTitle", "departmentName"):
-            if not out[field] and str(p.get(field) or "").strip():
-                out[field] = str(p[field]).strip()
-        out["totalBudget"] = max(safe_num(out["totalBudget"]),
-                                 safe_num(p.get("totalBudget")))
-        for c in as_list(p.get("components")):
-            if not isinstance(c, dict):
-                continue
-            name = str(c.get("name") or c.get("component") or "").strip()
-            if not name:
-                continue
-            cost = safe_num(c.get("cost") or c.get("amount"))
-            old = safe_num((comps.get(name.lower()) or {}).get("cost"))
-            comps[name.lower()] = {"name": name, "cost": max(cost, old)}
-        for x in as_list(p.get("districtWiseAllocation")):
-            if not isinstance(x, dict):
-                continue
-            name = str(x.get("district") or x.get("name") or "").strip()
-            if not name:
-                continue
-            key = norm_district(name)
-            amount = safe_num(x.get("amount"))
-            # chunk overlap duplicate de sakta hai -> max lete hain, sum nahi
-            if key not in dists or amount > safe_num(dists[key].get("amount")):
-                dists[key] = {"district": name, "amount": amount}
-    out["components"] = list(comps.values())
-    out["districtWiseAllocation"] = list(dists.values())
-    return out
-
-
-def attach_coords(data):
-    """Coordinates locally lagate hain — AI se poochne ki zaroorat nahi."""
-    rows, missing = [], []
-    for x in as_list(data.get("districtWiseAllocation")):
-        if not isinstance(x, dict):
-            continue
-        name = x.get("district") or x.get("name") or "—"
-        lat, lon = district_coords(name, x.get("latitude"), x.get("longitude"))
-        row = {"district": name, "amount": safe_num(x.get("amount"))}
-        if lat and lon:
-            row["latitude"], row["longitude"] = lat, lon
-        else:
-            missing.append(str(name))
-        rows.append(row)
-    data["districtWiseAllocation"] = rows
-    return data, missing
-
-
-# ----------------------------------------------------------------- pipeline
-PARSE_PROMPT = """Parse this PC-1 document text and return ONLY valid JSON.
-
-Schema:
-{
-  "projectTitle": "string",
-  "departmentName": "string",
-  "totalBudget": 0,
-  "components": [{"name": "string", "cost": 0}],
-  "districtWiseAllocation": [{"district": "string", "amount": 0}]
+SAMPLE = {
+    "add_title": "Construction of 50-Bed Category-D Hospital, Swat",
+    "add_dept": "Health Department",
+    "add_budget": 850_000_000.0,
+    "add_comps": ("Civil works: 520000000\nMedical equipment: 210000000\n"
+                  "Consultancy: 45000000\nContingencies: 75000000"),
+    "add_dists": "Swat: 500000000\nBuner: 200000000\nShangla: 150000000",
 }
 
-Rules:
-- All numbers must be plain JSON numbers (no commas, no currency words).
-- Do NOT output latitude/longitude — coordinates are added by the application.
-- If a value is absent use 0 or "", never guess.
-- Be concise: no explanations outside the JSON."""
+# ----------------------------------------------------------------- data + sidebar
+rows, load_err = load_projects()
+projects = [fields(r) for r in rows]
 
-PARSE_SYSTEM = ("You are a precise financial document parser. "
-                "Output strict, compact JSON only.")
+with st.sidebar:
+    st.markdown("### 📁 Project")
+    if st.button("🔄 Refresh"):
+        st.session_state.link_col = None
+        st.rerun()
 
+    sel = sel_row = None
+    if projects:
+        ids = [p["id"] for p in projects]
+        labels = [f"{p['title'][:42]}  ·  #{p['id']}" for p in projects]
+        start = ids.index(st.session_state.sel_id) \
+            if st.session_state.sel_id in ids else 0
+        idx = st.selectbox("Kis project par kaam karna hai?",
+                           options=range(len(labels)), index=start,
+                           format_func=lambda i: labels[i])
+        st.session_state.sel_id = ids[idx]
+        if st.session_state.get("chat_for") != ids[idx]:
+            st.session_state.chat_history = []      # doosre project ki baat na chale
+            st.session_state.chat_for = ids[idx]
+        sel, sel_row = projects[idx], rows[idx]
+        st.caption(f"DB mein kul {len(projects)} projects.")
+    elif load_err is None:
+        st.warning("DB khaali hai — neeche se aik project add karein.")
 
-def parse_slice(text_slice):
-    raw = call_groq(
-        [{"role": "system", "content": PARSE_SYSTEM},
-         {"role": "user", "content": f"{PARSE_PROMPT}\n\nDocument Text:\n{text_slice}"}],
-        json_mode=True, max_tokens=PARSE_OUTPUT_TOKENS, temperature=0.1)
-    return extract_json(raw)
+    with st.expander("➕ Naya project add karein"):
+        if st.button("📋 Sample data bhar dein"):
+            for k, v in SAMPLE.items():
+                st.session_state[k] = v
+            st.rerun()
+        with st.form("add_project"):
+            a_title = st.text_input("Project title", key="add_title")
+            a_dept = st.text_input("Department", key="add_dept")
+            a_budget = st.number_input("Total budget (PKR)", min_value=0.0,
+                                       step=1_000_000.0, format="%.0f",
+                                       key="add_budget")
+            a_comps = st.text_area("Components — har line: Naam: raqam",
+                                   key="add_comps", height=90)
+            a_dists = st.text_area("Districts — har line: District: raqam",
+                                   key="add_dists", height=90)
+            if st.form_submit_button("💾 Database mein save karein"):
+                if not a_title.strip():
+                    st.warning("Title likhna zaroori hai.")
+                else:
+                    path, err = insert_project(
+                        a_title.strip(), a_dept.strip() or "—",
+                        safe_num(a_budget), parse_lines(a_comps),
+                        parse_lines(a_dists))
+                    if err is None:
+                        st.session_state["flash"] = (
+                            f"✅ Project save ho gaya ({path}).")
+                        st.rerun()
+                    else:
+                        st.error("Save nahi hua — teeno raste fail huye:")
+                        st.exception(err)
 
-
-def parse_with_shrink(text_slice, label=""):
-    """413 aane par Groq ke bataye hue Limit/Requested se ratio nikaal kar text
-    chhota karte hain aur dobara bhejte hain — user ko kuch tune nahi karna parta."""
-    current = text_slice
-    for attempt in range(3):
-        try:
-            return parse_slice(current)
-        except TpmError as exc:
-            if attempt == 2 or not (exc.limit and exc.requested):
-                raise
-            allowed = exc.limit - PARSE_OUTPUT_TOKENS - SAFETY_TOKENS
-            sent_input = max(1, exc.requested - PARSE_OUTPUT_TOKENS)
-            ratio = min(0.9, max(0.15, allowed / sent_input))
-            new_len = max(800, int(len(current) * ratio))
-            st.info(f"413 aaya{label} — text {len(current):,} → {new_len:,} "
-                    "characters kar ke dobara bhej raha hun.")
-            current = current[:new_len]
-    raise RuntimeError("Shrink ke baad bhi TPM limit paar ho rahi hai.")
-
-
-def process_document(uploaded):
-    # ---- stage 1: PDF se text
-    try:
-        text, n_pages = pdf_to_text(uploaded)
-    except Exception as exc:
-        st.error("PDF khul nahi saka — file corrupt ya password-protected lagti hai.")
-        st.exception(exc)
-        return
-    if not text.strip():
-        st.error(f"{n_pages} page mile magar text 0 characters — ye scanned/image "
-                 "PDF hai. Pehle OCR karein (`ocrmypdf in.pdf out.pdf`) phir upload "
-                 "karein; warna AI ke paas parhne ke liye kuch nahi hota.")
-        return
-    st.session_state.doc_text = text
-    st.caption(f"✅ {n_pages} pages se {len(text):,} characters extract huye.")
-
-    budget = max(1_000, input_char_budget(PARSE_OUTPUT_TOKENS) - 700)  # prompt margin
-    deep = bool(st.session_state.get("deep_mode"))
-
-    # ---- stage 2: AI parsing (DB se alag, taake ghalti ka source saaf rahe)
-    if deep:
-        chunks = deep_chunks(text, budget)
-        st.info(f"🐢 Deep mode: {len(chunks)} hisse banaye. TPM limit "
-                f"({st.session_state.tpm_limit:,} tokens/min) ki wajah se hisson ke "
-                f"darmiyan intezar hoga — andaaza {max(1, len(chunks) // 2)} minute.")
-        bar = st.progress(0.0, text=f"0/{len(chunks)} hisse")
-        parts = []
-        for i, chunk in enumerate(chunks, 1):
+with st.sidebar:
+    with st.expander("🔧 Diagnostics"):
+        st.write({k: ("set ✅" if k in st.secrets else "MISSING ❌")
+                  for k in ("GROQ_API_KEY", "SUPABASE_URL", "SUPABASE_KEY",
+                            "DB_SECRET_KEY")})
+        vers = {}
+        for pkg in ("streamlit", "groq", "supabase", "folium",
+                    "streamlit-folium", "httpx"):
             try:
-                parts.append(parse_with_shrink(chunk, f" (hissa {i})"))
-            except Exception as exc:
-                st.warning(f"Hissa {i} skip hua: {exc}")
-            bar.progress(i / len(chunks), text=f"{i}/{len(chunks)} hisse")
-        bar.empty()
-        if not parts:
-            st.error("❌ Koi bhi hissa parse nahi ho saka.")
-            return
-        data = merge_parsed(parts)
-    else:
-        text_slice, trimmed = smart_extract(text, budget)
-        if trimmed:
-            st.info(f"Document {len(text):,} characters ka hai. TPM limit "
-                    f"({st.session_state.tpm_limit:,} tokens/min) ke hisab se sab se "
-                    f"ahem {len(text_slice):,} characters bheje ja rahe hain "
-                    f"(~{estimate_tokens(text_slice):,} tokens). Poora document "
-                    "parse karna ho to 'Deep mode' on kar ke dobara chalayein.")
-        with st.spinner("AI document parse kar raha hai…"):
+                vers[pkg] = importlib.metadata.version(pkg)
+            except Exception:
+                vers[pkg] = "—"
+        st.write(vers)
+        st.write("**Model:**", st.session_state.working_model
+                 or f"abhi tak koi call nahi; order: {MODEL_CANDIDATES[0]} …")
+        st.write("**Comments link column:**",
+                 st.session_state.link_col or "abhi detect nahi hua")
+        limit = st.number_input("TPM limit (Groq console → Limits)",
+                                min_value=1_000, max_value=2_000_000, step=1_000,
+                                value=int(st.session_state.tpm_limit))
+        if int(limit) != st.session_state.tpm_limit:
+            st.session_state.tpm_limit = int(limit)
+            st.rerun()
+        st.caption(f"Pichle 60s mein use: {tpm_used():,} / "
+                   f"{st.session_state.tpm_limit:,} tokens")
+        if st.button("🔌 AI test"):
             try:
-                data = parse_with_shrink(text_slice)
-            except TpmError as exc:
-                st.error(f"❌ TPM limit phir bhi paar ho rahi hai:\n\n{exc}")
-                st.info("Diagnostics tab mein TPM limit set karein, ya Groq Dev tier "
-                        "par upgrade karein.")
-                return
+                reply = call_groq([{"role": "user",
+                                    "content": "Reply with exactly: OK"}],
+                                 max_tokens=10)
+                st.success(f"{st.session_state.working_model} → {reply.strip()}")
             except Exception as exc:
-                st.error(f"❌ AI stage fail hui:\n\n{exc}")
-                st.info("Diagnostics tab → 'AI connection test' chalayein; wahan asli "
-                        "Groq error milta hai (model band / key ghalat / rate limit).")
-                return
+                st.error("AI call fail — asli Groq error:")
+                st.exception(exc)
+        if st.button("🗄️ Database test"):
+            for table in (TABLE_PROJECTS, TABLE_COMMENTS):
+                cols, n, exc = table_columns(table)
+                if exc is not None:
+                    st.error(f"`{table}` → error:")
+                    st.exception(exc)
+                elif n == 0:
+                    st.warning(f"`{table}` → 0 rows (khaali table, ya RLS ne "
+                               "SELECT rok diya — error nahi aata).")
+                else:
+                    st.success(f"`{table}` columns: {', '.join(cols)}")
 
-    data, missing = attach_coords(data)
-    st.session_state.doc_data = data
-    st.success(f"✅ AI parsing kamyaab — {st.session_state.active_engine}")
-    if missing:
-        st.caption("⚠️ In naamon ke coordinates local list mein nahi mile: "
-                   + ", ".join(sorted(set(missing))[:10]))
-    # ---- stage 3: database (fail ho to bhi AI ka natija screen par rehta hai)
-    with st.spinner("Supabase mein securely save…"):
-        try:
-            supabase.rpc('insert_secure_pc1', {
-                'p_project_title': data.get('projectTitle') or 'Unknown',
-                'p_department': data.get('departmentName') or 'Unknown',
-                'p_raw_payload': text,
-                'p_secret_key': DB_SECRET,
-                'p_total_budget': safe_num(data.get('totalBudget')),
-                'p_district_allocations': as_list(data.get('districtWiseAllocation')),
-                'p_verification_status': 'VERIFIED',
-            }).execute()
-            st.success("✅ Database mein save ho gaya.")
-        except Exception as exc:
-            st.warning("AI ne kaam kar diya lekin database save fail hua — data "
-                       "screen par mojood hai, DB error neeche hai.")
-            st.exception(exc)
+# ----------------------------------------------------------------- top-level state
+_flash = st.session_state.pop("flash", None)
+if _flash:
+    st.success(_flash)
+
+if load_err is not None:
+    st.error(f"❌ `{TABLE_PROJECTS}` table read nahi ho saka — asal error:")
+    st.exception(load_err)
+    st.info("Aam wajuhat: table ka naam mukhtalif hai, ya Row Level Security on "
+            "hai magar anon key ke liye SELECT policy nahi hai. "
+            "Sidebar → Diagnostics → 'Database test' se confirm karein.")
+elif not projects:
+    st.info("Database mein aik bhi project nahi mila. Ya table waqai khaali hai "
+            "(sidebar → ➕ se sample project add kar ke fauran test karein), ya "
+            "RLS SELECT policy missing hai — us soorat mein error nahi aata, "
+            "bas 0 rows aate hain.")
+
+tab_break, tab_chat, tab_cmt, tab_map = st.tabs(
+    ["📊 PC-1 Breakdown", "💬 AI Chat", "📝 DB & Comments", "🗺️ Map"])
+
+NEED_PROJECT = ("Sidebar se project chunein — ya agar list khaali hai to "
+                "sidebar → ➕ se aik project add karein.")
 
 
-# ----------------------------------------------------------------- tabs
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
-    ["📤 Upload PDF", "📊 PC-1 Breakdown", "💬 AI Chat",
-     "📝 DB & Comments", "🗺️ Maps", "🔧 Diagnostics"])
+def share_rows(items, label):
+    total = sum(safe_num(i["amount"]) for i in items) or 0
+    out = []
+    for i in items:
+        amount = safe_num(i["amount"])
+        out.append({label: i["name"], "Amount (PKR)": amount,
+                    "Share %": round(amount * 100.0 / total, 1) if total else 0.0})
+    return out, total
 
-with tab1:
-    uploaded_file = st.file_uploader("Upload PC-1 / PC-2 Document (PDF Format)",
-                                     type=['pdf'])
-    st.checkbox("🐢 Deep mode — poora document parse karo (dheema: free tier ki "
-                "TPM limit ki wajah se hisson ke darmiyan intezar hota hai)",
-                key="deep_mode")
-    st.caption(f"Free tier limit: {st.session_state.tpm_limit:,} tokens/min → aik "
-               f"request mein takreeban "
-               f"{max(1_000, input_char_budget(PARSE_OUTPUT_TOKENS) - 700):,} "
-               "characters ja sakte hain.")
-    if uploaded_file and st.button("🚀 Process & Secure Document"):
-        process_document(uploaded_file)
 
-with tab2:
-    d = st.session_state.doc_data
-    if not d:
-        st.warning("Pehle document upload karein.")
+with tab_break:
+    if sel is None:
+        st.info(NEED_PROJECT)
     else:
-        col1, col2 = st.columns(2)
-        with col1:
-            st.info(f"**Title:**\n{d.get('projectTitle') or '—'}")
-        with col2:
-            st.success(f"**Budget:**\nPKR {money(d.get('totalBudget'))}")
-        st.markdown("### 📋 Components")
-        components = [{"Component": c.get("name") or c.get("component") or "—",
-                       "Cost (PKR)": money(c.get("cost") or c.get("amount"))}
-                      for c in as_list(d.get('components')) if isinstance(c, dict)]
-        st.table(components or [{"Component": "—", "Cost (PKR)": "0"}])
-        st.markdown("### 📍 Districts")
-        districts = [{"District": x.get("district") or x.get("name") or "—",
-                      "Amount (PKR)": money(x.get("amount"))}
-                     for x in as_list(d.get('districtWiseAllocation'))
-                     if isinstance(x, dict)]
-        st.table(districts or [{"District": "—", "Amount (PKR)": "0"}])
-        with st.expander("Raw AI JSON (debugging ke liye)"):
-            st.json(d)
-CHAT_SYSTEM = ("You are a professional financial auditor for the KPK Government. "
-               "Answer strictly from the document context below. If something is "
-               "not in the context, say so plainly.\n\nDocument Context:\n")
+        st.markdown(f"#### {sel['title']}")
+        st.caption(f"Department: {sel['dept']}  ·  Status: {sel['status']}"
+                   + (f"  ·  Added: {sel['created']}" if sel['created'] else "")
+                   + f"  ·  ID: {sel['id']}")
 
-with tab3:
-    if not st.session_state.doc_text:
-        st.warning("Pehle document upload karein.")
+        comp_rows, comp_total = share_rows(sel["components"], "Component")
+        dist_rows, dist_total = share_rows(sel["districts"], "District")
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Total budget (PKR)", money(sel["budget"]))
+        m2.metric("Components ka total", money(comp_total),
+                  delta=(f"{money(comp_total - sel['budget'])} vs total budget"
+                         if comp_total else None), delta_color="off")
+        m3.metric("Districts ka total", money(dist_total),
+                  delta=(f"{money(dist_total - sel['budget'])} vs total budget"
+                         if dist_total else None), delta_color="off")
+        if comp_total and sel["budget"] and abs(comp_total - sel["budget"]) > 1:
+            st.warning(f"⚠️ Components ka jor (PKR {money(comp_total)}) total budget "
+                       f"(PKR {money(sel['budget'])}) se "
+                       f"{money(abs(comp_total - sel['budget']))} mukhtalif hai.")
+
+        st.markdown("##### 📋 Components")
+        if comp_rows:
+            st.dataframe(comp_rows, use_container_width=True, hide_index=True)
+        else:
+            st.caption("Is row mein components ka data nahi hai.")
+
+        st.markdown("##### 📍 District-wise allocation")
+        if dist_rows:
+            st.dataframe(dist_rows, use_container_width=True, hide_index=True)
+            st.bar_chart({"District": [d["name"] for d in sel["districts"]],
+                          "Amount": [safe_num(d["amount"])
+                                     for d in sel["districts"]]},
+                         x="District", y="Amount", height=280)
+        else:
+            st.caption("Is row mein district allocation ka data nahi hai.")
+
+        with st.expander("🧾 Database row (jaisi hai waisi)"):
+            st.json(sel_row)
+
+CHAT_SYSTEM = (
+    "You are a professional financial auditor for the Government of Khyber "
+    "Pakhtunkhwa reviewing PC-1/PC-2 development schemes. Answer ONLY from the "
+    "project data below. If a detail is not in the data, say plainly that the "
+    "record does not contain it — never invent numbers. All amounts are in PKR. "
+    "Keep answers short, specific and auditor-like.\n\nPROJECT DATA:\n")
+
+
+def project_context(p):
+    lines = [f"Title: {p['title']}", f"Department: {p['dept']}",
+             f"Verification status: {p['status']}",
+             f"Total budget: {money(p['budget'])}"]
+    if p["components"]:
+        total = sum(safe_num(c["amount"]) for c in p["components"])
+        lines.append("Components (name: amount):")
+        lines += [f"- {c['name']}: {money(c['amount'])}" for c in p["components"]]
+        lines.append(f"Components add up to: {money(total)} "
+                     f"(difference from total budget: "
+                     f"{money(total - safe_num(p['budget']))})")
+    if p["districts"]:
+        total = sum(safe_num(d["amount"]) for d in p["districts"])
+        lines.append("District-wise allocation (district: amount):")
+        lines += [f"- {d['name']}: {money(d['amount'])}" for d in p["districts"]]
+        lines.append(f"Districts add up to: {money(total)}")
+    return "\n".join(lines)
+
+
+def all_context(ps):
+    lines = ["Summary of every project in the database "
+             "(title | department | budget | districts):"]
+    for p in ps[:40]:
+        names = ", ".join(d["name"] for d in p["districts"][:6]) or "—"
+        lines.append(f"- {p['title']} | {p['dept']} | {money(p['budget'])} | {names}")
+    return "\n".join(lines)
+
+
+with tab_chat:
+    if sel is None:
+        st.info(NEED_PROJECT)
     else:
-        st.markdown(f"<div class='engine-badge'>Active Engine: "
+        st.markdown(f"<div class='engine-badge'>Engine: "
                     f"{st.session_state.active_engine}</div>",
                     unsafe_allow_html=True)
+        wide = st.checkbox("Saare projects ka data bhi bhejein (comparison ke liye)")
+        st.caption(f"Context: {'sab projects' if wide else sel['title']}")
+
         for msg in st.session_state.chat_history:
             bubble(msg["role"], msg["content"])
 
-        user_input = st.chat_input("Ask a question…")
-        if user_input:
+        question = None
+        c1, c2, c3 = st.columns(3)
+        if c1.button("Budget summary"):
+            question = ("Is project ka budget summary aur components ka breakdown "
+                        "batayein.")
+        if c2.button("Total match karta hai?"):
+            question = ("Kya components aur district allocations ka jor total budget "
+                        "se match karta hai? Farq ho to number ke saath batayein.")
+        if c3.button("Sab se bara district"):
+            question = ("Kis district ko sab se ziyada allocation mila aur kitna "
+                        "percentage? Top 3 batayein.")
+
+        with st.form("chat_form", clear_on_submit=True):
+            typed = st.text_input("Sawal likhein:",
+                                  placeholder="e.g. civil works ka hissa kitna hai?")
+            if st.form_submit_button("Send") and typed.strip():
+                question = typed.strip()
+
+        if question:
             st.session_state.chat_history.append({"role": "user",
-                                                  "content": user_input})
-            # purani baat-cheet bhi bhejein, warna har sawal alag-thalag hota hai
-            recent = st.session_state.chat_history[-CHAT_MEMORY_TURNS * 2:]
-            hist_chars = sum(len(str(m["content"])) for m in recent)
-            doc_budget = max(1_000, input_char_budget(CHAT_OUTPUT_TOKENS)
-                             - hist_chars - len(CHAT_SYSTEM) - 200)
-            context = context_for_question(st.session_state.doc_text, user_input,
-                                          min(MAX_CHAT_DOC_CHARS, doc_budget))
-            messages = [{"role": "system", "content": CHAT_SYSTEM + context}]
-            for m in recent:
-                messages.append({
-                    "role": "assistant" if m["role"] in ("ai", "assistant") else "user",
-                    "content": m["content"]})
-            sent = False
+                                                  "content": question})
+            ctx = all_context(projects) if wide else project_context(sel)
+            room = max(600, input_char_budget(CHAT_OUTPUT_TOKENS)
+                       - len(CHAT_SYSTEM) - 600)
+            messages = [{"role": "system", "content": CHAT_SYSTEM + ctx[:room]}]
+            for m in st.session_state.chat_history[-CHAT_MEMORY_TURNS * 2:]:
+                messages.append({"role": "user" if m["role"] == "user"
+                                 else "assistant", "content": m["content"]})
+            done = False
             with st.spinner("Groq soch raha hai…"):
                 try:
-                    reply = call_groq(messages, max_tokens=CHAT_OUTPUT_TOKENS,
-                                      temperature=0.3)
+                    reply = call_groq(messages, max_tokens=CHAT_OUTPUT_TOKENS)
                     st.session_state.chat_history.append({"role": "assistant",
                                                           "content": reply})
-                    sent = True
+                    done = True
                 except TpmError as exc:
                     st.session_state.chat_history.pop()
                     st.error(f"⏳ Token limit: {exc}")
                 except Exception as exc:
-                    st.session_state.chat_history.pop()   # nakaam sawal na rahe
-                    st.error(f"❌ Chat fail hui:\n\n{exc}")
-            if sent:
+                    st.session_state.chat_history.pop()
+                    st.error("❌ Chat fail hui — asli error:")
+                    st.exception(exc)
+            if done:
                 st.rerun()
+        if st.session_state.chat_history and st.button("🧹 Chat clear karein"):
+            st.session_state.chat_history = []
+            st.rerun()
 
-with tab4:
-    projects = None
-    try:
-        projects = supabase.table("secure_pc1").select("id, project_title").execute()
-    except Exception as exc:
-        st.error("Supabase se project list nahi mili:")
-        st.exception(exc)
-    if projects is not None and projects.data:
-        chosen = st.selectbox("Select Project:", options=projects.data,
-                              format_func=lambda r: f"{r['project_title']} (#{r['id']})")
-        proj_id = chosen["id"]
-        try:
-            comments = supabase.table("pc1_comments").select("*") \
-                .eq("pc1_id", proj_id).order("created_at", desc=False).execute()
-            for c in comments.data or []:
-                st.markdown(f"**{c.get('commenter_name', '—')}**: "
-                            f"{c.get('comment_text', '')}")
-                st.divider()
-        except Exception as exc:
-            st.error("Comments load nahi ho sake:")
-            st.exception(exc)
-        with st.form("comment_form"):
-            c_name = st.text_input("Name:")
-            c_text = st.text_area("Review:")
-            if st.form_submit_button("Submit"):
+with tab_cmt:
+    if sel is None:
+        st.info(NEED_PROJECT)
+    else:
+        st.markdown(f"#### {sel['title']}")
+        comments, cmt_err = load_comments(sel["id"])
+        if cmt_err is not None:
+            st.error(f"❌ `{TABLE_COMMENTS}` se comments nahi mile — asal error:")
+            st.exception(cmt_err)
+            st.info("Teen cheezein check karein: table ka naam, project ka link "
+                    f"column ({' / '.join(LINK_CANDIDATES)}), aur RLS SELECT policy.")
+        st.caption(f"{len(comments)} comments  ·  link column: "
+                   f"{st.session_state.link_col or 'detect nahi hua'}")
+        for c in comments:
+            who = html.escape(str(pick(c, CNAME_KEYS, "—")))
+            what = html.escape(str(pick(c, CTEXT_KEYS, ""))).replace("\n", "<br>")
+            when = str(pick(c, CREATED_KEYS, "") or "")[:19]
+            st.markdown(f"<div class='cmt'><b>{who}</b> "
+                        f"<span style='color:#94a3b8;font-size:12px;'>{when}</span>"
+                        f"<br>{what}</div>", unsafe_allow_html=True)
+        if not comments and cmt_err is None:
+            st.caption("Abhi koi comment nahi — pehla comment aap likhein.")
+
+        with st.form("cmt_form", clear_on_submit=True):
+            c_name = st.text_input("Aap ka naam")
+            c_text = st.text_area("Comment / review", height=100)
+            if st.form_submit_button("📝 Comment save karein"):
                 if not (c_name.strip() and c_text.strip()):
-                    st.warning("Naam aur review dono likhna zaroori hai.")
+                    st.warning("Naam aur comment dono likhna zaroori hai.")
                 else:
-                    try:
-                        supabase.table("pc1_comments").insert(
-                            {"pc1_id": proj_id, "commenter_name": c_name,
-                             "comment_text": c_text}).execute()
+                    err = add_comment(sel["id"], c_name.strip(), c_text.strip())
+                    if err is None:
+                        st.session_state["flash"] = "✅ Comment save ho gaya."
                         st.rerun()
-                    except Exception as exc:
-                        st.error("Comment save nahi hua:")
-                        st.exception(exc)
-    elif projects is not None:
-        st.info("Database khaali hai — pehle koi document process karein.")
-with tab5:
-    try:
-        res = supabase.table("secure_pc1") \
-            .select("project_title, district_allocations").execute()
-    except Exception as exc:
-        st.error("Map ka data load nahi hua:")
-        st.exception(exc)
-        res = None
-    if res is not None:
-        kp_map = folium.Map(location=[34.0151, 71.5249], zoom_start=7,
-                            tiles="CartoDB positron")
-        markers = 0
-        for proj in res.data or []:
-            # column agar text hai to yahan str aata hai — as_list us ko handle karta hai
-            for loc in as_list(proj.get('district_allocations')):
-                if not isinstance(loc, dict):
-                    continue
-                lat = safe_num(loc.get('latitude'), None)
-                lon = safe_num(loc.get('longitude'), None)
-                if lat in (None, 0) or lon in (None, 0):
-                    continue
-                folium.Marker(
-                    location=[lat, lon],
-                    popup=f"{proj.get('project_title', '')} — "
-                          f"{loc.get('district', '')}: PKR {money(loc.get('amount'))}"
-                ).add_to(kp_map)
-                markers += 1
-        st_folium(kp_map, width=1000, height=500, returned_objects=[])
-        if markers == 0:
-            st.info("Koi marker nahi bana — matlab district_allocations khaali hai "
-                    "ya us mein latitude/longitude mojood nahi.")
-        else:
-            st.caption(f"{markers} district markers.")
-with tab6:
-    st.markdown("### 🔧 Diagnostics")
-    st.write("**Secrets:**", {k: ("set ✅" if k in st.secrets else "MISSING ❌")
-                              for k in ("GROQ_API_KEY", "SUPABASE_URL",
-                                        "SUPABASE_KEY", "DB_SECRET_KEY")})
-    versions = {}
-    for pkg in ("streamlit", "groq", "supabase", "pypdf", "PyPDF2",
-                "folium", "streamlit-folium", "httpx"):
-        try:
-            versions[pkg] = importlib.metadata.version(pkg)
-        except Exception:
-            versions[pkg] = "—"
-    st.write("**Versions:**", versions)
-    st.write("**Model try order:**", MODEL_CANDIDATES)
-    st.write("**Last working model:**",
-             st.session_state.working_model or "abhi tak koi call kamyaab nahi hui")
+                    else:
+                        st.error("❌ Comment save nahi hua — asal error:")
+                        st.exception(err)
 
-    st.markdown("#### Token budget")
-    new_limit = st.number_input(
-        "TPM limit (tokens per minute) — Groq console → Settings → Limits se dekhein",
-        min_value=1_000, max_value=2_000_000, step=1_000,
-        value=int(st.session_state.tpm_limit))
-    if new_limit != st.session_state.tpm_limit:
-        st.session_state.tpm_limit = int(new_limit)
-        st.rerun()
-    st.write(f"Pichle 60 seconds mein use: **{tpm_used():,}** / "
-             f"{st.session_state.tpm_limit:,} tokens  ·  aik request ka input budget: "
-             f"**{input_char_budget(PARSE_OUTPUT_TOKENS):,}** characters "
-             f"(~{estimate_tokens(' ' * input_char_budget(PARSE_OUTPUT_TOKENS)):,} tokens)")
-    st.caption("Groq 'Requested' mein input tokens + max_tokens dono ginta hai — "
-               "isi liye purana max_tokens=8000 akela hi 8000 ki limit kha jata tha.")
-
-    col_a, col_b = st.columns(2)
-    with col_a:
-        if st.button("🔌 AI connection test"):
-            try:
-                reply = call_groq([{"role": "user",
-                                    "content": "Reply with exactly: OK"}],
-                                  max_tokens=10)
-                st.success(f"Model zinda hai → {st.session_state.working_model}\n\n"
-                           f"Jawab: {reply.strip()}")
-            except Exception as exc:
-                st.error("AI call fail hui — asli Groq error:")
-                st.exception(exc)
-    with col_b:
-        if st.button("🗄️ Database connection test"):
-            try:
-                probe = supabase.table("secure_pc1").select("id").limit(1).execute()
-                st.success(f"Supabase reachable — sample rows: "
-                           f"{len(probe.data or [])}")
-            except Exception as exc:
-                st.error("Supabase call fail hui:")
-                st.exception(exc)
+with tab_map:
+    only_sel = st.checkbox("Sirf selected project ke districts dikhayein",
+                           value=False, disabled=sel is None)
+    kp_map = folium.Map(location=[34.4, 71.9], zoom_start=7,
+                        tiles="CartoDB positron")
+    shown, missing = 0, []
+    for p in projects:
+        is_sel = sel is not None and p["id"] == sel["id"]
+        if only_sel and not is_sel:
+            continue
+        for d in p["districts"]:
+            lat, lon = district_coords(d["name"], d.get("lat"), d.get("lon"))
+            if not lat or not lon:
+                missing.append(str(d["name"]))
+                continue
+            folium.Marker(
+                [lat, lon],
+                tooltip=f"{d['name']} — PKR {money(d['amount'])}",
+                popup=folium.Popup(f"<b>{html.escape(p['title'])}</b><br>"
+                                   f"{html.escape(str(d['name']))}<br>"
+                                   f"PKR {money(d['amount'])}", max_width=280),
+                icon=folium.Icon(color="green" if is_sel else "blue",
+                                 icon="info-sign"),
+            ).add_to(kp_map)
+            shown += 1
+    st_folium(kp_map, width=1000, height=520, returned_objects=[], key="kp_map")
+    if shown:
+        st.caption(f"{shown} markers (green = selected project). Coordinates "
+                   "locally rakhe gaye hain — AI se nahi maange jate.")
+    else:
+        st.info("Koi marker nahi bana — matlab kisi bhi project mein district "
+                "allocation ka data nahi hai.")
+    if missing:
+        st.caption("Ye naam KPK district list mein nahi mile: "
+                   + ", ".join(sorted(set(missing))[:12]))
