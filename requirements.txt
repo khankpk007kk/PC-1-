@@ -1,7 +1,8 @@
-# PC-1-2 Solution Hub — dependencies (simple build: koi PDF parsing nahi)
+# PC-1-2 Solution Hub — dependencies
 # Floors jaan-boojh kar rakhe hain (exact pin chahiye to `pip freeze` se lein).
 streamlit>=1.31       # st.rerun(), st.dataframe(hide_index=...), st.bar_chart(x=,y=)
 groq>=0.20            # purana groq + httpx>=0.28 = "unexpected keyword argument 'proxies'"
 supabase>=2.10
+pypdf>=4.2            # PC-1 PDF se text (PyPDF2 par bhi chal jata hai)
 folium>=0.18
 streamlit-folium>=0.20
