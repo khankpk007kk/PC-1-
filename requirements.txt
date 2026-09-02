@@ -1,7 +1,8 @@
-streamlit
-supabase
-folium
-streamlit-folium
-pydantic
-PyPDF2
-groq
+# PC-1-2 Solution Hub — dependencies
+# Floors jaan-boojh kar rakhe hain (exact pin lagana ho to `pip freeze` se lein).
+streamlit>=1.44        # st.chat_input ko tab ke andar rakhne ke liye naya version chahiye
+groq>=0.20             # purane groq + httpx>=0.28 = "unexpected keyword argument 'proxies'" error
+supabase>=2.10
+pypdf>=5.0             # PyPDF2 archived hai; pypdf uska maintained successor hai
+folium>=0.18
+streamlit-folium>=0.20
