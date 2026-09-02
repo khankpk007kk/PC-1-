@@ -1,8 +1,7 @@
-# PC-1-2 Solution Hub — dependencies
-# Floors jaan-boojh kar rakhe hain (exact pin lagana ho to `pip freeze` se lein).
-streamlit>=1.44        # st.chat_input ko tab ke andar rakhne ke liye naya version chahiye
-groq>=0.20             # purane groq + httpx>=0.28 = "unexpected keyword argument 'proxies'" error
+# PC-1-2 Solution Hub — dependencies (simple build: koi PDF parsing nahi)
+# Floors jaan-boojh kar rakhe hain (exact pin chahiye to `pip freeze` se lein).
+streamlit>=1.31       # st.rerun(), st.dataframe(hide_index=...), st.bar_chart(x=,y=)
+groq>=0.20            # purana groq + httpx>=0.28 = "unexpected keyword argument 'proxies'"
 supabase>=2.10
-pypdf>=5.0             # PyPDF2 archived hai; pypdf uska maintained successor hai
 folium>=0.18
 streamlit-folium>=0.20
