@@ -12,6 +12,7 @@ import importlib.metadata
 import json
 import os
 import re
+import time
 
 import folium
 import streamlit as st
@@ -33,15 +34,25 @@ MODEL_CANDIDATES = [
 ]
 DEAD_MODEL_HINTS = ("decommission", "deprecat", "does not exist",
                     "not found", "no longer")
-MAX_DOC_CHARS = 24_000          # ~6k tokens: free-tier TPM limit se bachne ke liye
 MAX_CHAT_DOC_CHARS = 12_000
-CHAT_MEMORY_TURNS = 6
+CHAT_MEMORY_TURNS = 4
+
+# Groq free tier ka TPM (tokens per minute) bohot chhota hai — aur Groq
+# "Requested" mein input tokens + max_tokens DONO ginta hai. Aapke org par
+# limit 8000 thi, is liye akela max_tokens=8000 hi poora budget kha gaya tha.
+TPM_LIMIT = 8_000            # Diagnostics tab se badal sakte hain
+CHARS_PER_TOKEN = 2.2        # PC-1 tables/numbers itni tight tokenize hoti hain
+SAFETY_TOKENS = 400          # system prompt + JSON overhead ka margin
+PARSE_OUTPUT_TOKENS = 1_600  # JSON jawab ke liye reserve
+CHAT_OUTPUT_TOKENS = 800
+CHUNK_OVERLAP_CHARS = 250
 
 st.set_page_config(page_title="PC-1-2 Solution Hub", layout="wide",
                    initial_sidebar_state="collapsed")
 
 for _key, _val in {"doc_text": "", "doc_data": None, "chat_history": [],
-                   "active_engine": "Pending", "working_model": None}.items():
+                   "active_engine": "Pending", "working_model": None,
+                   "tpm_log": [], "tpm_limit": TPM_LIMIT}.items():
     st.session_state.setdefault(_key, _val)
 # ----------------------------------------------------------------- helpers
 def safe_num(value, default=0):
@@ -64,6 +75,63 @@ def safe_num(value, default=0):
 
 def money(value):
     return f"{safe_num(value):,.0f}"
+
+
+# --------------------------------------------- token budget / TPM management
+class TpmError(RuntimeError):
+    """413 / 429 — request TPM window se bari thi."""
+
+    def __init__(self, message, limit=None, requested=None):
+        super().__init__(message)
+        self.limit = limit
+        self.requested = requested
+
+
+def parse_tpm_error(exc):
+    """Groq ke message se 'Limit 8000, Requested 19287' nikaal leta hai."""
+    msg = str(exc)
+    if "rate_limit_exceeded" not in msg and "Request too large" not in msg:
+        return None
+    lim = re.search(r"Limit\s+([\d,]+)", msg)
+    req = re.search(r"Requested\s+([\d,]+)", msg)
+    return TpmError(msg,
+                    int(lim.group(1).replace(",", "")) if lim else None,
+                    int(req.group(1).replace(",", "")) if req else None)
+
+
+def estimate_tokens(text):
+    return int(len(text) / CHARS_PER_TOKEN) + 1
+
+
+def input_char_budget(output_tokens):
+    """Aik request mein kitne characters bhej sakte hain. Groq 'Requested' mein
+    input tokens AUR max_tokens dono ginta hai — yahi 413 ki asal wajah thi."""
+    room = st.session_state.tpm_limit - output_tokens - SAFETY_TOKENS
+    return max(800, int(room * CHARS_PER_TOKEN))
+
+
+def tpm_used():
+    now = time.time()
+    st.session_state.tpm_log = [(t, n) for t, n in st.session_state.tpm_log
+                                if now - t < 60]
+    return sum(n for _, n in st.session_state.tpm_log)
+
+
+def tpm_wait_if_needed(planned_tokens):
+    """60-second window mein jagah na bache to khud intezar karta hai —
+    429 khaane se behtar hai."""
+    used = tpm_used()
+    if used + planned_tokens <= st.session_state.tpm_limit:
+        return
+    oldest = min(t for t, _ in st.session_state.tpm_log)
+    wait = max(1, int(62 - (time.time() - oldest)))
+    box = st.empty()
+    for left in range(wait, 0, -1):
+        box.info(f"⏳ TPM window bhar gaya ({used:,}/{st.session_state.tpm_limit:,} "
+                 f"tokens pichle minute mein) — {left}s intezar…")
+        time.sleep(1)
+    box.empty()
+    tpm_used()
 
 
 def extract_json(text):
@@ -138,9 +206,13 @@ def _looks_dead(exc):
     return any(hint in msg for hint in DEAD_MODEL_HINTS)
 
 
-def call_groq(messages, json_mode=False, max_tokens=4096, temperature=0.2):
+def call_groq(messages, json_mode=False, max_tokens=1600, temperature=0.2):
     """Pehla zinda model use karta hai. Model band ho jaye to khud agla try karta
-    hai, taake aage kabhi Groq kisi model ko retire kare to app na ruke."""
+    hai. TPM window ka hisaab bhi rakhta hai aur 413/429 ko TpmError banata hai
+    taake caller text chhota kar ke dobara koshish kar sake."""
+    planned = sum(estimate_tokens(m["content"]) for m in messages) + max_tokens
+    tpm_wait_if_needed(planned)
+
     order = [m for m in MODEL_CANDIDATES]
     working = st.session_state.get("working_model")
     if working in order:
@@ -156,10 +228,18 @@ def call_groq(messages, json_mode=False, max_tokens=4096, temperature=0.2):
         try:
             resp = groq_client.chat.completions.create(**kwargs)
         except Exception as exc:
+            tpm = parse_tpm_error(exc)
+            if tpm is not None:
+                if tpm.limit:                     # asli limit yaad rakh lo
+                    st.session_state.tpm_limit = tpm.limit
+                st.session_state.tpm_log.append((time.time(), planned))
+                raise tpm from exc
             errors.append(f"• {model} → {exc}")
             if _looks_dead(exc):
-                continue                    # ye model mar chuka hai, agla try karo
+                continue                          # ye model mar chuka hai
             raise RuntimeError("\n".join(errors)) from exc
+        used = getattr(getattr(resp, "usage", None), "total_tokens", 0) or 0
+        st.session_state.tpm_log.append((time.time(), max(used, planned)))
         st.session_state.working_model = model
         st.session_state.active_engine = f"Groq ({model})"
         return resp.choices[0].message.content
@@ -211,10 +291,180 @@ st.markdown(f"""
     <div style="flex:1;display:flex;justify-content:flex-end;">{logo_html}</div>
 </div>
 """, unsafe_allow_html=True)
+# ------------------------------------- KPK districts (locally, AI se nahi)
+# Approximate district-headquarter coordinates. Ye locally rakhne ke do faide:
+# AI ka output aadha ho gaya (TPM bachta hai) aur hallucinated coordinates
+# ka masla khatam.
+KPK_COORDS = {
+    "peshawar": (34.0151, 71.5249), "nowshera": (34.0153, 71.9747),
+    "charsadda": (34.1682, 71.7404), "mardan": (34.1989, 72.0231),
+    "swabi": (34.1202, 72.4696), "kohat": (33.5869, 71.4414),
+    "karak": (33.1167, 71.0937), "hangu": (33.5333, 71.0500),
+    "bannu": (32.9889, 70.6056), "lakki marwat": (32.6072, 70.9111),
+    "dera ismail khan": (31.8313, 70.9017), "tank": (32.2167, 70.3833),
+    "abbottabad": (34.1688, 73.2215), "haripur": (33.9942, 72.9333),
+    "mansehra": (34.3300, 73.1968), "battagram": (34.6797, 73.0233),
+    "torghar": (34.5500, 72.8500), "upper kohistan": (35.2900, 73.2800),
+    "lower kohistan": (35.1000, 73.0000), "kolai-palas": (34.8500, 73.0500),
+    "shangla": (34.8833, 72.7167), "swat": (34.7717, 72.3600),
+    "buner": (34.4167, 72.4667), "malakand": (34.5667, 71.9333),
+    "lower dir": (34.8300, 71.8400), "upper dir": (35.2072, 71.8747),
+    "lower chitral": (35.8518, 71.7864), "upper chitral": (36.2800, 72.2100),
+    "bajaur": (34.7500, 71.5300), "mohmand": (34.3100, 71.4200),
+    "khyber": (34.0200, 71.3800), "kurram": (33.9000, 70.1000),
+    "orakzai": (33.6600, 70.9400), "north waziristan": (33.0000, 70.0700),
+    "upper south waziristan": (32.3000, 69.5700),
+    "lower south waziristan": (32.0500, 69.9000),
+}
+DISTRICT_ALIASES = {
+    "d.i. khan": "dera ismail khan", "d.i.khan": "dera ismail khan",
+    "di khan": "dera ismail khan", "dikhan": "dera ismail khan",
+    "dera ismael khan": "dera ismail khan", "mingora": "swat",
+    "saidu sharif": "swat", "timergara": "lower dir", "dir lower": "lower dir",
+    "dir": "lower dir", "dir upper": "upper dir", "chitral": "lower chitral",
+    "chitral lower": "lower chitral", "chitral upper": "upper chitral",
+    "kohistan": "lower kohistan", "kohistan upper": "upper kohistan",
+    "kohistan lower": "lower kohistan", "kolai palas": "kolai-palas",
+    "south waziristan": "lower south waziristan",
+    "waziristan north": "north waziristan", "batkhela": "malakand",
+    "daggar": "buner", "alpuri": "shangla", "parachinar": "kurram",
+    "miranshah": "north waziristan", "wana": "upper south waziristan",
+    "kalaya": "orakzai", "ghalanai": "mohmand", "khar": "bajaur",
+    "jamrud": "khyber", "judbah": "torghar",
+}
+
+
+def norm_district(name):
+    key = re.sub(r"\b(district|agency|tehsil)\b", " ", str(name).lower())
+    key = re.sub(r"[^a-z\s.\-]", " ", key)
+    key = re.sub(r"\s+", " ", key).strip()
+    return DISTRICT_ALIASES.get(key, key)
+
+
+def district_coords(name, fallback_lat=None, fallback_lon=None):
+    key = norm_district(name)
+    if key in KPK_COORDS:
+        return KPK_COORDS[key]
+    for known in KPK_COORDS:              # "swat valley" -> swat
+        if known in key or key in known:
+            return KPK_COORDS[known]
+    lat, lon = safe_num(fallback_lat, None), safe_num(fallback_lon, None)
+    return (lat, lon) if (lat and lon) else (None, None)
+
+
+# --------------------------------- document ko TPM budget ke andar laana
+SCORE_WORDS = ("total", "cost", "budget", "million", "billion", "pkr", "rs.",
+               "component", "allocation", "district", "estimate", "phase",
+               "financial", "capital", "revenue", "scheme", "project")
+
+
+def score_block(block):
+    low = block.lower()
+    score = sum(low.count(w) * 2 for w in SCORE_WORDS)
+    score += sum(4 for d in KPK_COORDS if d in low)
+    score += sum(c.isdigit() for c in block) // 10
+    return score
+
+
+def smart_extract(text, budget_chars, block_size=1200):
+    """Poora document TPM mein nahi aata. Is liye sirf wo blocks bhejte hain
+    jin mein budget/district/component ka data hai — pehla block (title aur
+    department) hamesha shamil rehta hai."""
+    if len(text) <= budget_chars:
+        return text, False
+    blocks = [text[i:i + block_size] for i in range(0, len(text), block_size)]
+    keep, total = {0}, len(blocks[0])
+    for i in sorted(range(1, len(blocks)),
+                    key=lambda j: score_block(blocks[j]), reverse=True):
+        if total + len(blocks[i]) + 8 > budget_chars:
+            continue
+        keep.add(i)
+        total += len(blocks[i]) + 8
+    return "\n[…]\n".join(blocks[i] for i in sorted(keep)), True
+
+
+def context_for_question(text, question, budget_chars):
+    """Chat ke liye sawal ke keywords wale hisse chunte hain — chhote token
+    budget mein document ke shuru ke 12k chars se kaafi behtar jawab milta hai."""
+    if len(text) <= budget_chars:
+        return text
+    words = re.findall(r"[a-zA-Z]{4,}", question.lower())[:12]
+    blocks = [text[i:i + 1200] for i in range(0, len(text), 1200)]
+
+    def rank(i):
+        low = blocks[i].lower()
+        return sum(low.count(w) * 5 for w in words) + score_block(blocks[i])
+
+    keep, total = set(), 0
+    for i in sorted(range(len(blocks)), key=rank, reverse=True):
+        if total + len(blocks[i]) + 8 > budget_chars:
+            continue
+        keep.add(i)
+        total += len(blocks[i]) + 8
+    return "\n[…]\n".join(blocks[i] for i in sorted(keep))
+
+
+def deep_chunks(text, budget_chars):
+    step = max(500, budget_chars - CHUNK_OVERLAP_CHARS)
+    return [text[i:i + budget_chars] for i in range(0, len(text), step)]
+
+
+def merge_parsed(parts):
+    """Deep mode ke kai hisson ka JSON aik mein jorta hai."""
+    out = {"projectTitle": "", "departmentName": "", "totalBudget": 0,
+           "components": [], "districtWiseAllocation": []}
+    comps, dists = {}, {}
+    for p in parts:
+        for field in ("projectTitle", "departmentName"):
+            if not out[field] and str(p.get(field) or "").strip():
+                out[field] = str(p[field]).strip()
+        out["totalBudget"] = max(safe_num(out["totalBudget"]),
+                                 safe_num(p.get("totalBudget")))
+        for c in as_list(p.get("components")):
+            if not isinstance(c, dict):
+                continue
+            name = str(c.get("name") or c.get("component") or "").strip()
+            if not name:
+                continue
+            cost = safe_num(c.get("cost") or c.get("amount"))
+            old = safe_num((comps.get(name.lower()) or {}).get("cost"))
+            comps[name.lower()] = {"name": name, "cost": max(cost, old)}
+        for x in as_list(p.get("districtWiseAllocation")):
+            if not isinstance(x, dict):
+                continue
+            name = str(x.get("district") or x.get("name") or "").strip()
+            if not name:
+                continue
+            key = norm_district(name)
+            amount = safe_num(x.get("amount"))
+            # chunk overlap duplicate de sakta hai -> max lete hain, sum nahi
+            if key not in dists or amount > safe_num(dists[key].get("amount")):
+                dists[key] = {"district": name, "amount": amount}
+    out["components"] = list(comps.values())
+    out["districtWiseAllocation"] = list(dists.values())
+    return out
+
+
+def attach_coords(data):
+    """Coordinates locally lagate hain — AI se poochne ki zaroorat nahi."""
+    rows, missing = [], []
+    for x in as_list(data.get("districtWiseAllocation")):
+        if not isinstance(x, dict):
+            continue
+        name = x.get("district") or x.get("name") or "—"
+        lat, lon = district_coords(name, x.get("latitude"), x.get("longitude"))
+        row = {"district": name, "amount": safe_num(x.get("amount"))}
+        if lat and lon:
+            row["latitude"], row["longitude"] = lat, lon
+        else:
+            missing.append(str(name))
+        rows.append(row)
+    data["districtWiseAllocation"] = rows
+    return data, missing
+
+
 # ----------------------------------------------------------------- pipeline
 PARSE_PROMPT = """Parse this PC-1 document text and return ONLY valid JSON.
-Extract project title, department name, total budget, component breakdown, and
-district-wise allocation with approximate latitude/longitude for each KPK district.
 
 Schema:
 {
@@ -222,11 +472,45 @@ Schema:
   "departmentName": "string",
   "totalBudget": 0,
   "components": [{"name": "string", "cost": 0}],
-  "districtWiseAllocation": [{"district": "string", "amount": 0, "latitude": 0.0, "longitude": 0.0}]
+  "districtWiseAllocation": [{"district": "string", "amount": 0}]
 }
 
-Rules: all numbers must be JSON numbers (no commas, no currency words). If a
-value is absent in the document use 0 or "" instead of guessing."""
+Rules:
+- All numbers must be plain JSON numbers (no commas, no currency words).
+- Do NOT output latitude/longitude — coordinates are added by the application.
+- If a value is absent use 0 or "", never guess.
+- Be concise: no explanations outside the JSON."""
+
+PARSE_SYSTEM = ("You are a precise financial document parser. "
+                "Output strict, compact JSON only.")
+
+
+def parse_slice(text_slice):
+    raw = call_groq(
+        [{"role": "system", "content": PARSE_SYSTEM},
+         {"role": "user", "content": f"{PARSE_PROMPT}\n\nDocument Text:\n{text_slice}"}],
+        json_mode=True, max_tokens=PARSE_OUTPUT_TOKENS, temperature=0.1)
+    return extract_json(raw)
+
+
+def parse_with_shrink(text_slice, label=""):
+    """413 aane par Groq ke bataye hue Limit/Requested se ratio nikaal kar text
+    chhota karte hain aur dobara bhejte hain — user ko kuch tune nahi karna parta."""
+    current = text_slice
+    for attempt in range(3):
+        try:
+            return parse_slice(current)
+        except TpmError as exc:
+            if attempt == 2 or not (exc.limit and exc.requested):
+                raise
+            allowed = exc.limit - PARSE_OUTPUT_TOKENS - SAFETY_TOKENS
+            sent_input = max(1, exc.requested - PARSE_OUTPUT_TOKENS)
+            ratio = min(0.9, max(0.15, allowed / sent_input))
+            new_len = max(800, int(len(current) * ratio))
+            st.info(f"413 aaya{label} — text {len(current):,} → {new_len:,} "
+                    "characters kar ke dobara bhej raha hun.")
+            current = current[:new_len]
+    raise RuntimeError("Shrink ke baad bhi TPM limit paar ho rahi hai.")
 
 
 def process_document(uploaded):
@@ -245,29 +529,56 @@ def process_document(uploaded):
     st.session_state.doc_text = text
     st.caption(f"✅ {n_pages} pages se {len(text):,} characters extract huye.")
 
-    clipped = text[:MAX_DOC_CHARS]
-    if len(text) > MAX_DOC_CHARS:
-        st.warning(f"Document bara hai — AI ko pehle {MAX_DOC_CHARS:,} characters "
-                   "bheje ja rahe hain. Poora document bhejne par free tier ka "
-                   "tokens-per-minute limit 413/429 error deta hai.")
+    budget = max(1_000, input_char_budget(PARSE_OUTPUT_TOKENS) - 700)  # prompt margin
+    deep = bool(st.session_state.get("deep_mode"))
 
     # ---- stage 2: AI parsing (DB se alag, taake ghalti ka source saaf rahe)
-    with st.spinner("AI document parse kar raha hai…"):
-        try:
-            raw = call_groq(
-                [{"role": "system", "content": "You are a precise financial "
-                  "document parser. Output strict JSON only."},
-                 {"role": "user",
-                  "content": f"{PARSE_PROMPT}\n\nDocument Text:\n{clipped}"}],
-                json_mode=True, max_tokens=8000, temperature=0.1)
-            data = extract_json(raw)
-        except Exception as exc:
-            st.error(f"❌ AI stage fail hui:\n\n{exc}")
-            st.info("Diagnostics tab → 'AI connection test' chalayein; wahan asli "
-                    "Groq error milta hai (model band / key ghalat / rate limit).")
+    if deep:
+        chunks = deep_chunks(text, budget)
+        st.info(f"🐢 Deep mode: {len(chunks)} hisse banaye. TPM limit "
+                f"({st.session_state.tpm_limit:,} tokens/min) ki wajah se hisson ke "
+                f"darmiyan intezar hoga — andaaza {max(1, len(chunks) // 2)} minute.")
+        bar = st.progress(0.0, text=f"0/{len(chunks)} hisse")
+        parts = []
+        for i, chunk in enumerate(chunks, 1):
+            try:
+                parts.append(parse_with_shrink(chunk, f" (hissa {i})"))
+            except Exception as exc:
+                st.warning(f"Hissa {i} skip hua: {exc}")
+            bar.progress(i / len(chunks), text=f"{i}/{len(chunks)} hisse")
+        bar.empty()
+        if not parts:
+            st.error("❌ Koi bhi hissa parse nahi ho saka.")
             return
+        data = merge_parsed(parts)
+    else:
+        text_slice, trimmed = smart_extract(text, budget)
+        if trimmed:
+            st.info(f"Document {len(text):,} characters ka hai. TPM limit "
+                    f"({st.session_state.tpm_limit:,} tokens/min) ke hisab se sab se "
+                    f"ahem {len(text_slice):,} characters bheje ja rahe hain "
+                    f"(~{estimate_tokens(text_slice):,} tokens). Poora document "
+                    "parse karna ho to 'Deep mode' on kar ke dobara chalayein.")
+        with st.spinner("AI document parse kar raha hai…"):
+            try:
+                data = parse_with_shrink(text_slice)
+            except TpmError as exc:
+                st.error(f"❌ TPM limit phir bhi paar ho rahi hai:\n\n{exc}")
+                st.info("Diagnostics tab mein TPM limit set karein, ya Groq Dev tier "
+                        "par upgrade karein.")
+                return
+            except Exception as exc:
+                st.error(f"❌ AI stage fail hui:\n\n{exc}")
+                st.info("Diagnostics tab → 'AI connection test' chalayein; wahan asli "
+                        "Groq error milta hai (model band / key ghalat / rate limit).")
+                return
+
+    data, missing = attach_coords(data)
     st.session_state.doc_data = data
     st.success(f"✅ AI parsing kamyaab — {st.session_state.active_engine}")
+    if missing:
+        st.caption("⚠️ In naamon ke coordinates local list mein nahi mile: "
+                   + ", ".join(sorted(set(missing))[:10]))
     # ---- stage 3: database (fail ho to bhi AI ka natija screen par rehta hai)
     with st.spinner("Supabase mein securely save…"):
         try:
@@ -295,6 +606,13 @@ tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
 with tab1:
     uploaded_file = st.file_uploader("Upload PC-1 / PC-2 Document (PDF Format)",
                                      type=['pdf'])
+    st.checkbox("🐢 Deep mode — poora document parse karo (dheema: free tier ki "
+                "TPM limit ki wajah se hisson ke darmiyan intezar hota hai)",
+                key="deep_mode")
+    st.caption(f"Free tier limit: {st.session_state.tpm_limit:,} tokens/min → aik "
+               f"request mein takreeban "
+               f"{max(1_000, input_char_budget(PARSE_OUTPUT_TOKENS) - 700):,} "
+               "characters ja sakte hain.")
     if uploaded_file and st.button("🚀 Process & Secure Document"):
         process_document(uploaded_file)
 
@@ -341,8 +659,12 @@ with tab3:
                                                   "content": user_input})
             # purani baat-cheet bhi bhejein, warna har sawal alag-thalag hota hai
             recent = st.session_state.chat_history[-CHAT_MEMORY_TURNS * 2:]
-            messages = [{"role": "system", "content":
-                         CHAT_SYSTEM + st.session_state.doc_text[:MAX_CHAT_DOC_CHARS]}]
+            hist_chars = sum(len(str(m["content"])) for m in recent)
+            doc_budget = max(1_000, input_char_budget(CHAT_OUTPUT_TOKENS)
+                             - hist_chars - len(CHAT_SYSTEM) - 200)
+            context = context_for_question(st.session_state.doc_text, user_input,
+                                          min(MAX_CHAT_DOC_CHARS, doc_budget))
+            messages = [{"role": "system", "content": CHAT_SYSTEM + context}]
             for m in recent:
                 messages.append({
                     "role": "assistant" if m["role"] in ("ai", "assistant") else "user",
@@ -350,10 +672,14 @@ with tab3:
             sent = False
             with st.spinner("Groq soch raha hai…"):
                 try:
-                    reply = call_groq(messages, max_tokens=1500, temperature=0.3)
+                    reply = call_groq(messages, max_tokens=CHAT_OUTPUT_TOKENS,
+                                      temperature=0.3)
                     st.session_state.chat_history.append({"role": "assistant",
                                                           "content": reply})
                     sent = True
+                except TpmError as exc:
+                    st.session_state.chat_history.pop()
+                    st.error(f"⏳ Token limit: {exc}")
                 except Exception as exc:
                     st.session_state.chat_history.pop()   # nakaam sawal na rahe
                     st.error(f"❌ Chat fail hui:\n\n{exc}")
@@ -447,6 +773,21 @@ with tab6:
     st.write("**Model try order:**", MODEL_CANDIDATES)
     st.write("**Last working model:**",
              st.session_state.working_model or "abhi tak koi call kamyaab nahi hui")
+
+    st.markdown("#### Token budget")
+    new_limit = st.number_input(
+        "TPM limit (tokens per minute) — Groq console → Settings → Limits se dekhein",
+        min_value=1_000, max_value=2_000_000, step=1_000,
+        value=int(st.session_state.tpm_limit))
+    if new_limit != st.session_state.tpm_limit:
+        st.session_state.tpm_limit = int(new_limit)
+        st.rerun()
+    st.write(f"Pichle 60 seconds mein use: **{tpm_used():,}** / "
+             f"{st.session_state.tpm_limit:,} tokens  ·  aik request ka input budget: "
+             f"**{input_char_budget(PARSE_OUTPUT_TOKENS):,}** characters "
+             f"(~{estimate_tokens(' ' * input_char_budget(PARSE_OUTPUT_TOKENS)):,} tokens)")
+    st.caption("Groq 'Requested' mein input tokens + max_tokens dono ginta hai — "
+               "isi liye purana max_tokens=8000 akela hi 8000 ki limit kha jata tha.")
 
     col_a, col_b = st.columns(2)
     with col_a:
